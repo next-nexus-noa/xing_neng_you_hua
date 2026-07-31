@@ -101,7 +101,6 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
-        self._adaptive_previous_pending_first_token_ids: set[str] = set()
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -351,66 +350,6 @@ class Scheduler(SchedulerInterface):
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:
-        adaptive_waiting_count: int | None = None
-        adaptive_running_count: int | None = None
-        adaptive_oldest_wait_ms: float | None = None
-        adaptive_pending_first_token_count: int | None = None
-        adaptive_oldest_first_token_wait_ms: float | None = None
-        adaptive_pending_prefill_tokens: int | None = None
-        adaptive_completed_first_token_count: int | None = None
-        if bool(getattr(self.parallel_config, "enable_adaptive_ubatch", False)):
-            now = time.time()
-            waiting_requests = [
-                *self.waiting,
-                *self.skipped_waiting,
-            ]
-            adaptive_waiting_count = len(waiting_requests)
-            adaptive_running_count = len(self.running)
-            if waiting_requests:
-                oldest_request = min(
-                    waiting_requests,
-                    key=lambda request: request.arrival_time,
-                )
-                adaptive_oldest_wait_ms = max(
-                    0.0,
-                    (now - oldest_request.arrival_time) * 1000.0,
-                )
-            pending_first_token = [
-                request
-                for request in itertools.chain(
-                    waiting_requests,
-                    self.running,
-                )
-                if request.num_output_tokens == 0
-            ]
-            adaptive_pending_first_token_count = len(pending_first_token)
-            pending_first_token_ids = {
-                request.request_id
-                for request in pending_first_token
-            }
-            adaptive_completed_first_token_count = len(
-                self._adaptive_previous_pending_first_token_ids
-                - pending_first_token_ids
-            )
-            self._adaptive_previous_pending_first_token_ids = (
-                pending_first_token_ids
-            )
-            adaptive_oldest_first_token_wait_ms = max(
-                (
-                    max(0.0, (now - request.arrival_time) * 1000.0)
-                    for request in pending_first_token
-                ),
-                default=0.0,
-            )
-            adaptive_pending_prefill_tokens = sum(
-                max(
-                    0,
-                    request.num_prompt_tokens
-                    - request.num_computed_tokens,
-                )
-                for request in pending_first_token
-            )
-
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -997,21 +936,6 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
-            adaptive_waiting_count=adaptive_waiting_count,
-            adaptive_running_count=adaptive_running_count,
-            adaptive_oldest_wait_ms=adaptive_oldest_wait_ms,
-            adaptive_pending_first_token_count=(
-                adaptive_pending_first_token_count
-            ),
-            adaptive_oldest_first_token_wait_ms=(
-                adaptive_oldest_first_token_wait_ms
-            ),
-            adaptive_pending_prefill_tokens=(
-                adaptive_pending_prefill_tokens
-            ),
-            adaptive_completed_first_token_count=(
-                adaptive_completed_first_token_count
-            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

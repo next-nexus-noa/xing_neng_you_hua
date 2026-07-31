@@ -539,11 +539,6 @@ class NPUModelRunner(GPUModelRunner):
         self._pending_adaptive_pp_elapsed_ms: float | None = None
         self._pending_adaptive_pp_npu_events: tuple[Any, Any] | None = None
         self._pending_adaptive_pp_send_wait_ms = 0.0
-        # Cross-stage MAX feedback is launched after the previous PP send
-        # completes and overlapped with preparation of the next worker step.
-        # Keeping it synchronous at the next selector call inserted an
-        # unmodelled control-plane bubble that dominated short/light scenes.
-        self._pending_adaptive_pp_reduction: tuple[Any, Any] | None = None
         self._active_adaptive_pp_npu_start_event: Any | None = None
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
@@ -1963,7 +1958,6 @@ class NPUModelRunner(GPUModelRunner):
     def _select_adaptive_pp_microbatch_count(
         self,
         num_scheduled_tokens_np: np.ndarray,
-        scheduler_output: "SchedulerOutput | None" = None,
     ) -> AdaptiveUBatchDecision:
         if self.adaptive_ubatch_controller is None:
             self.adaptive_ubatch_controller = AdaptiveUBatchController(
@@ -1973,40 +1967,6 @@ class NPUModelRunner(GPUModelRunner):
             )
         decision = self.adaptive_ubatch_controller.select(
             num_scheduled_tokens_np,
-            waiting_count=(
-                getattr(scheduler_output, "adaptive_waiting_count", 0) or 0
-            ),
-            running_count=(
-                getattr(scheduler_output, "adaptive_running_count", 0) or 0
-            ),
-            oldest_wait_ms=(
-                getattr(scheduler_output, "adaptive_oldest_wait_ms", 0.0)
-                or 0.0
-            ),
-            pending_first_token_count=(
-                getattr(
-                    scheduler_output,
-                    "adaptive_pending_first_token_count",
-                    0,
-                )
-                or 0
-            ),
-            oldest_first_token_wait_ms=(
-                getattr(
-                    scheduler_output,
-                    "adaptive_oldest_first_token_wait_ms",
-                    0.0,
-                )
-                or 0.0
-            ),
-            pending_prefill_tokens=(
-                getattr(
-                    scheduler_output,
-                    "adaptive_pending_prefill_tokens",
-                    0,
-                )
-                or 0
-            ),
         )
         max_count = self._pp_microbatch_configured_count()
         num_ubatches = max(1, min(decision.num_ubatches, max_count))
@@ -2059,15 +2019,6 @@ class NPUModelRunner(GPUModelRunner):
             fallback=decision.fallback if fallback is None else fallback,
             decision_overhead_us=decision.decision_overhead_us,
             candidate_scores=decision.candidate_scores,
-            waiting_count=decision.waiting_count,
-            running_count=decision.running_count,
-            oldest_wait_ms=decision.oldest_wait_ms,
-            pending_first_token_count=decision.pending_first_token_count,
-            oldest_first_token_wait_ms=(
-                decision.oldest_first_token_wait_ms
-            ),
-            pending_prefill_tokens=decision.pending_prefill_tokens,
-            probation=decision.probation,
         )
 
     def _use_mirrored_adaptive_pp_microbatch_decision(
@@ -2092,33 +2043,16 @@ class NPUModelRunner(GPUModelRunner):
         decision: AdaptiveUBatchDecision | None,
         *,
         forward_ms: float,
-        next_waiting_count: int | None = None,
-        next_running_count: int | None = None,
-        next_oldest_wait_ms: float | None = None,
-        next_pending_first_token_count: int | None = None,
-        next_oldest_first_token_wait_ms: float | None = None,
-        next_pending_prefill_tokens: int | None = None,
-        completed_first_token_count: int | None = None,
     ) -> None:
         if self.adaptive_ubatch_controller is None or decision is None:
             return
         self.adaptive_ubatch_controller.observe(
             decision,
             forward_ms=forward_ms,
-            next_waiting_count=next_waiting_count,
-            next_running_count=next_running_count,
-            next_oldest_wait_ms=next_oldest_wait_ms,
-            next_pending_first_token_count=next_pending_first_token_count,
-            next_oldest_first_token_wait_ms=(
-                next_oldest_first_token_wait_ms
-            ),
-            next_pending_prefill_tokens=next_pending_prefill_tokens,
-            completed_first_token_count=completed_first_token_count,
         )
 
     def _flush_adaptive_pp_microbatch_result(
         self,
-        scheduler_output: "SchedulerOutput | None" = None,
     ) -> None:
         """Feed the previous step's PP critical path to the controller.
 
@@ -2131,28 +2065,9 @@ class NPUModelRunner(GPUModelRunner):
         elapsed_ms = self._pending_adaptive_pp_elapsed_ms
         if decision is None or elapsed_ms is None:
             return
-        pending_reduction = getattr(
-            self,
-            "_pending_adaptive_pp_reduction",
-            None,
-        )
         pp = get_pp_group()
-        if pending_reduction is not None:
-            elapsed, work = pending_reduction
-            if work is not None:
-                wait_start = time.perf_counter()
-                work.wait()
-                logger.debug(
-                    "Adaptive PP async feedback wait tail: %.3f ms",
-                    (time.perf_counter() - wait_start) * 1000.0,
-                )
-            elapsed_ms = float(elapsed.item())
-        else:
-            elapsed_ms = self._pending_adaptive_pp_local_elapsed()
-        if pp.world_size > 1 and pending_reduction is None:
-            # Compatibility fallback for callers that do not use Worker or
-            # for an asynchronous launch failure. Normal serving launches
-            # this reduction earlier and overlaps it with input preparation.
+        elapsed_ms = self._pending_adaptive_pp_local_elapsed()
+        if pp.world_size > 1:
             elapsed = torch.tensor(
                 [elapsed_ms],
                 dtype=torch.float64,
@@ -2167,47 +2082,11 @@ class NPUModelRunner(GPUModelRunner):
         self._observe_adaptive_pp_microbatch_result(
             decision,
             forward_ms=elapsed_ms,
-            next_waiting_count=getattr(
-                scheduler_output,
-                "adaptive_waiting_count",
-                None,
-            ),
-            next_running_count=getattr(
-                scheduler_output,
-                "adaptive_running_count",
-                None,
-            ),
-            next_oldest_wait_ms=getattr(
-                scheduler_output,
-                "adaptive_oldest_wait_ms",
-                None,
-            ),
-            next_pending_first_token_count=getattr(
-                scheduler_output,
-                "adaptive_pending_first_token_count",
-                None,
-            ),
-            next_oldest_first_token_wait_ms=getattr(
-                scheduler_output,
-                "adaptive_oldest_first_token_wait_ms",
-                None,
-            ),
-            next_pending_prefill_tokens=getattr(
-                scheduler_output,
-                "adaptive_pending_prefill_tokens",
-                None,
-            ),
-            completed_first_token_count=getattr(
-                scheduler_output,
-                "adaptive_completed_first_token_count",
-                None,
-            ),
         )
         self._pending_adaptive_pp_decision = None
         self._pending_adaptive_pp_elapsed_ms = None
         self._pending_adaptive_pp_npu_events = None
         self._pending_adaptive_pp_send_wait_ms = 0.0
-        self._pending_adaptive_pp_reduction = None
         self._active_adaptive_pp_decision = None
         self._active_adaptive_pp_step_start = None
         self._active_adaptive_pp_npu_start_event = None
@@ -2261,67 +2140,6 @@ class NPUModelRunner(GPUModelRunner):
             ),
         )
 
-    def _start_adaptive_pp_feedback_reduction(self) -> None:
-        """Start cross-stage MAX feedback without blocking the next step.
-
-        Worker calls this only after the previous PP send has completed. The
-        CPU collective can then run concurrently with next-step input
-        preparation, and ``_flush_adaptive_pp_microbatch_result`` waits only
-        for any remaining tail before making the next decision.
-        """
-        if (
-            os.getenv(
-                "ADAPTIVE_UBATCH_FEEDBACK_REDUCTION",
-                "async",
-            )
-            .strip()
-            .lower()
-            == "sync"
-        ):
-            # Reproduce the feedback semantics used by the best-performing
-            # July 29 controller.  The next decision point will take the
-            # existing synchronous MAX compatibility path in
-            # _flush_adaptive_pp_microbatch_result.
-            logger.info_once(
-                "Adaptive PP cross-stage feedback uses synchronous CPU MAX "
-                "reduction (best_20260729 compatibility profile)."
-            )
-            return
-        if (
-            getattr(self, "_pending_adaptive_pp_decision", None) is None
-            or getattr(self, "_pending_adaptive_pp_elapsed_ms", None) is None
-            or getattr(self, "_pending_adaptive_pp_reduction", None)
-            is not None
-        ):
-            return
-        pp = get_pp_group()
-        if pp.world_size <= 1:
-            return
-        elapsed = torch.tensor(
-            [self._pending_adaptive_pp_local_elapsed()],
-            dtype=torch.float64,
-            device="cpu",
-        )
-        try:
-            work = dist.all_reduce(
-                elapsed,
-                op=dist.ReduceOp.MAX,
-                group=pp.cpu_group,
-                async_op=True,
-            )
-        except (RuntimeError, TypeError, ValueError):
-            logger.debug(
-                "Unable to launch asynchronous adaptive PP feedback; "
-                "using the synchronous compatibility path.",
-                exc_info=True,
-            )
-            return
-        self._pending_adaptive_pp_reduction = (elapsed, work)
-        logger.info_once(
-            "Adaptive PP cross-stage feedback uses asynchronous CPU MAX "
-            "reduction overlapped with next-step input preparation."
-        )
-
     def _should_measure_adaptive_pp_critical_path(
         self,
         decision: AdaptiveUBatchDecision,
@@ -2348,12 +2166,10 @@ class NPUModelRunner(GPUModelRunner):
         return (
             self._adaptive_pp_feedback_step % interval == 0
             or decision.switched
-            or bool(getattr(decision, "probation", False))
             or decision.reason
             in {
                 "candidate_calibration",
                 "controlled_exploration",
-                "paired_safe_refresh",
             }
         )
 
@@ -2368,7 +2184,6 @@ class NPUModelRunner(GPUModelRunner):
         self._pending_adaptive_pp_elapsed_ms = elapsed_ms
         self._pending_adaptive_pp_npu_events = npu_events
         self._pending_adaptive_pp_send_wait_ms = 0.0
-        self._pending_adaptive_pp_reduction = None
 
     def _add_pending_adaptive_pp_send_wait(self, elapsed_ms: float) -> None:
         """Attribute deferred PP-send completion to the step that created it."""
@@ -2888,13 +2703,10 @@ class NPUModelRunner(GPUModelRunner):
                 adaptive_pp_step_start = 0.0
                 if pp_microbatch_enabled:
                     if bool(getattr(self.parallel_config, "enable_adaptive_ubatch", False)):
-                        self._flush_adaptive_pp_microbatch_result(
-                            scheduler_output
-                        )
+                        self._flush_adaptive_pp_microbatch_result()
                         local_decision = (
                             self._select_adaptive_pp_microbatch_count(
                                 num_scheduled_tokens_np,
-                                scheduler_output,
                             )
                         )
                         adaptive_pp_decision = (

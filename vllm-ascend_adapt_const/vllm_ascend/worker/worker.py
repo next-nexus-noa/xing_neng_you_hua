@@ -578,26 +578,6 @@ class NPUWorker(WorkerBase):
                         (time.perf_counter() - send_wait_start) * 1000.0
                     )
 
-        # The previous PP send is now complete on every stage, so it is safe
-        # to launch the small CPU MAX reduction used by adaptive feedback.
-        # Starting it here overlaps collective latency with the next step's
-        # receive/input preparation instead of creating a selector-side
-        # synchronization bubble.
-        if bool(
-            getattr(
-                self.vllm_config.parallel_config,
-                "enable_adaptive_ubatch",
-                False,
-            )
-        ):
-            start_adaptive_feedback = getattr(
-                self.model_runner,
-                "_start_adaptive_pp_feedback_reduction",
-                None,
-            )
-            if start_adaptive_feedback is not None:
-                start_adaptive_feedback()
-
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         pp = get_pp_group()

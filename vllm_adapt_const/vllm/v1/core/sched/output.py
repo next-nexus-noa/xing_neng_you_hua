@@ -238,20 +238,6 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
-    # Queue-pressure snapshot captured before this scheduling step. These
-    # fields are populated only for the adaptive PP micro-batch path so fixed-M
-    # execution does not pay for additional scheduler bookkeeping.
-    adaptive_waiting_count: int | None = None
-    adaptive_running_count: int | None = None
-    adaptive_oldest_wait_ms: float | None = None
-    adaptive_pending_first_token_count: int | None = None
-    adaptive_oldest_first_token_wait_ms: float | None = None
-    adaptive_pending_prefill_tokens: int | None = None
-    # Number of requests from the previous scheduler snapshot that have
-    # produced their first output token. Unlike a raw pending-count delta,
-    # this cohort signal is not distorted by newly arriving requests.
-    adaptive_completed_first_token_count: int | None = None
-
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

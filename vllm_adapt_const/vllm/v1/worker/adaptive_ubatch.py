@@ -16,25 +16,6 @@ import numpy as np
 import regex as re
 
 
-_BEST_POLICY_PROFILE = "best_20260729"
-
-
-def _best_policy_profile_enabled() -> bool:
-    """Use the controller behavior from the best July 29 experiment.
-
-    The newer safety controller remains available for ablation/debugging via
-    ``ADAPTIVE_UBATCH_POLICY_PROFILE=current_safe``.  Keep this switch outside
-    ParallelConfig so the rollback does not change the public vLLM CLI or
-    baseline execution path.
-    """
-    return (
-        os.getenv("ADAPTIVE_UBATCH_POLICY_PROFILE", "current_safe")
-        .strip()
-        .lower()
-        == _BEST_POLICY_PROFILE
-    )
-
-
 @dataclass(frozen=True)
 class AdaptiveUBatchFeatures:
     total_tokens: int
@@ -48,12 +29,6 @@ class AdaptiveUBatchFeatures:
     avg_tokens_per_req: float
     model_billions: float
     hidden_size: int
-    waiting_count: int
-    running_count: int
-    oldest_wait_ms: float
-    pending_first_token_count: int
-    oldest_first_token_wait_ms: float
-    pending_prefill_tokens: int
     bucket_key: tuple[str, ...]
 
 
@@ -98,9 +73,6 @@ class CalibrationState:
     last_predicted_ms: float | None = None
     last_prior_ms: float | None = None
     last_update_step: int = -1
-    pressure_count: int = 0
-    ewma_queue_progress: float = 0.0
-    ewma_first_token_rate: float = 0.0
 
     def update(
         self,
@@ -144,28 +116,6 @@ class CalibrationState:
         self.last_prior_ms = prior_ms
         self.last_update_step = step_id
 
-    def update_queue_progress(
-        self,
-        *,
-        queue_progress: float,
-        first_token_rate: float,
-        alpha: float,
-    ) -> None:
-        if self.pressure_count == 0:
-            self.ewma_queue_progress = queue_progress
-            self.ewma_first_token_rate = first_token_rate
-        else:
-            self.ewma_queue_progress = (
-                alpha * queue_progress
-                + (1.0 - alpha) * self.ewma_queue_progress
-            )
-            self.ewma_first_token_rate = (
-                alpha * first_token_rate
-                + (1.0 - alpha) * self.ewma_first_token_rate
-            )
-        self.pressure_count += 1
-
-
 @dataclass
 class BucketDecisionState:
     current_m: int
@@ -173,11 +123,6 @@ class BucketDecisionState:
     pending_m: int | None = None
     pending_wins: int = 0
     bad_streak: int = 0
-    queue_stall_streak: int = 0
-    safe_refresh_required: bool = False
-    validating_m: int | None = None
-    probation_m: int | None = None
-    probation_observations_left: int = 0
 
 
 @dataclass(frozen=True)
@@ -189,10 +134,6 @@ class CandidateScore:
     uncertainty_ms: float
     robust_cost_ms: float
     count: int
-    queue_progress: float | None = None
-    first_token_rate: float | None = None
-    queue_penalty_ms: float = 0.0
-    pressure_count: int = 0
     last_update_step: int = -1
     rejected: bool = False
     rejection_reason: str | None = None
@@ -212,10 +153,6 @@ class CandidateScore:
             "uncertainty_ms": self.uncertainty_ms,
             "robust_ms": self.robust_cost_ms,
             "count": self.count,
-            "queue_progress": self.queue_progress,
-            "first_token_rate": self.first_token_rate,
-            "queue_penalty_ms": self.queue_penalty_ms,
-            "pressure_count": self.pressure_count,
             "last_update_step": self.last_update_step,
             "rejected": self.rejected,
             "rejection_reason": self.rejection_reason,
@@ -238,13 +175,6 @@ class AdaptiveUBatchDecision:
     fallback: bool = False
     decision_overhead_us: float | None = None
     candidate_scores: tuple[dict[str, Any], ...] = ()
-    waiting_count: int = 0
-    running_count: int = 0
-    oldest_wait_ms: float = 0.0
-    pending_first_token_count: int = 0
-    oldest_first_token_wait_ms: float = 0.0
-    pending_prefill_tokens: int = 0
-    probation: bool = False
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -262,13 +192,6 @@ class AdaptiveUBatchDecision:
             "fallback": self.fallback,
             "decision_overhead_us": self.decision_overhead_us,
             "candidate_scores": list(self.candidate_scores),
-            "waiting_count": self.waiting_count,
-            "running_count": self.running_count,
-            "oldest_wait_ms": self.oldest_wait_ms,
-            "pending_first_token_count": self.pending_first_token_count,
-            "oldest_first_token_wait_ms": self.oldest_first_token_wait_ms,
-            "pending_prefill_tokens": self.pending_prefill_tokens,
-            "probation": self.probation,
         }
 
     @classmethod
@@ -293,25 +216,6 @@ class AdaptiveUBatchDecision:
                 payload.get("decision_overhead_us")
             ),
             candidate_scores=tuple(payload.get("candidate_scores", ())),
-            waiting_count=max(0, int(payload.get("waiting_count", 0))),
-            running_count=max(0, int(payload.get("running_count", 0))),
-            oldest_wait_ms=max(
-                0.0,
-                float(payload.get("oldest_wait_ms", 0.0)),
-            ),
-            pending_first_token_count=max(
-                0,
-                int(payload.get("pending_first_token_count", 0)),
-            ),
-            oldest_first_token_wait_ms=max(
-                0.0,
-                float(payload.get("oldest_first_token_wait_ms", 0.0)),
-            ),
-            pending_prefill_tokens=max(
-                0,
-                int(payload.get("pending_prefill_tokens", 0)),
-            ),
-            probation=bool(payload.get("probation", False)),
         )
 
 
@@ -344,21 +248,6 @@ def _with_feature_counts(
     if (
         decision.total_tokens == features.total_tokens
         and decision.num_reqs == features.num_reqs
-        and decision.waiting_count == features.waiting_count
-        and decision.running_count == features.running_count
-        and decision.oldest_wait_ms == features.oldest_wait_ms
-        and (
-            decision.pending_first_token_count
-            == features.pending_first_token_count
-        )
-        and (
-            decision.oldest_first_token_wait_ms
-            == features.oldest_first_token_wait_ms
-        )
-        and (
-            decision.pending_prefill_tokens
-            == features.pending_prefill_tokens
-        )
     ):
         return decision
     return AdaptiveUBatchDecision(
@@ -376,120 +265,7 @@ def _with_feature_counts(
         fallback=decision.fallback,
         decision_overhead_us=decision.decision_overhead_us,
         candidate_scores=decision.candidate_scores,
-        waiting_count=features.waiting_count,
-        running_count=features.running_count,
-        oldest_wait_ms=features.oldest_wait_ms,
-        pending_first_token_count=features.pending_first_token_count,
-        oldest_first_token_wait_ms=features.oldest_first_token_wait_ms,
-        pending_prefill_tokens=features.pending_prefill_tokens,
-        probation=decision.probation,
     )
-
-
-def _queue_progress_score(
-    decision: AdaptiveUBatchDecision,
-    *,
-    actual_ms: float,
-    next_waiting_count: int | None,
-    next_running_count: int | None,
-    next_oldest_wait_ms: float | None,
-    next_pending_first_token_count: int | None,
-    next_oldest_first_token_wait_ms: float | None,
-    next_pending_prefill_tokens: int | None,
-    completed_first_token_count: int | None = None,
-) -> tuple[float | None, bool, float]:
-    """Return normalized request-pressure progress and a stall indicator.
-
-    A score above zero means first-token/prefill pressure drained efficiently
-    per unit wall time. A negative score means pressure accumulated. Count and
-    token deltas must be time-normalized: every M executes the same scheduler
-    output, so a per-step fraction alone would rate a slow M exactly like a
-    fast M. Age remains a secondary signal because new arrivals can
-    legitimately increase queue population between scheduler steps.
-    """
-    if (
-        decision.pending_first_token_count <= 0
-        or next_waiting_count is None
-        or next_running_count is None
-        or next_oldest_wait_ms is None
-        or next_pending_first_token_count is None
-        or next_oldest_first_token_wait_ms is None
-        or next_pending_prefill_tokens is None
-        or not _is_finite_positive(actual_ms)
-    ):
-        return None, False, 0.0
-
-    next_waiting = max(0, int(next_waiting_count))
-    next_running = max(0, int(next_running_count))
-    next_oldest = max(0.0, float(next_oldest_wait_ms))
-    next_first_token_count = max(
-        0,
-        int(next_pending_first_token_count),
-    )
-    next_first_token_wait = max(
-        0.0,
-        float(next_oldest_first_token_wait_ms),
-    )
-    next_prefill_tokens = max(0, int(next_pending_prefill_tokens))
-    elapsed = max(actual_ms, 1e-6)
-    oldest_progress = (
-        decision.oldest_wait_ms + elapsed - next_oldest
-    ) / elapsed
-    waiting_progress = (
-        decision.waiting_count - next_waiting
-    ) / max(1, decision.waiting_count)
-    running_progress = (
-        decision.running_count - next_running
-    ) / max(1, decision.running_count)
-    first_token_age_progress = (
-        decision.oldest_first_token_wait_ms
-        + elapsed
-        - next_first_token_wait
-    ) / elapsed
-    first_token_count_progress = (
-        decision.pending_first_token_count
-        - next_first_token_count
-    ) / max(1, decision.pending_first_token_count)
-    completed_first_tokens = (
-        max(0, int(completed_first_token_count))
-        if completed_first_token_count is not None
-        else max(
-            0,
-            decision.pending_first_token_count
-            - next_first_token_count,
-        )
-    )
-    cohort_first_token_progress = (
-        completed_first_tokens
-        / max(1, decision.pending_first_token_count)
-    )
-    first_token_rate = completed_first_tokens * 1000.0 / elapsed
-    prefill_progress = (
-        decision.pending_prefill_tokens - next_prefill_tokens
-    ) / max(1, decision.pending_prefill_tokens)
-    def clamp(value: float) -> float:
-        return max(-2.0, min(2.0, value))
-
-    # Convert fractional progress to a per-second service efficiency before
-    # clamping. This makes candidates comparable when they complete the same
-    # scheduled work with different full-worker-step durations.
-    rate_scale = 1000.0 / elapsed
-    progress = (
-        0.25 * clamp(cohort_first_token_progress * rate_scale)
-        + 0.05 * clamp(first_token_count_progress * rate_scale)
-        + 0.25 * clamp(prefill_progress * rate_scale)
-        + 0.10 * clamp(waiting_progress * rate_scale)
-        + 0.05 * clamp(running_progress * rate_scale)
-        + 0.20 * clamp(first_token_age_progress)
-        + 0.10 * clamp(oldest_progress)
-    )
-    stalled = (
-        next_first_token_count >= decision.pending_first_token_count
-        and next_first_token_wait
-        >= decision.oldest_first_token_wait_ms + 0.75 * elapsed
-        and next_prefill_tokens >= decision.pending_prefill_tokens
-    )
-    return progress, stalled, first_token_rate
 
 
 def _extract_model_billions(model_config: Any) -> float | None:
@@ -578,24 +354,15 @@ def _bucketize_features(
     decode_reqs: int,
     prefill_ratio: float,
 ) -> tuple[str, str, str]:
-    if _best_policy_profile_enabled():
-        # Exact bucket boundaries used by the best-performing controller.
-        # Pooling 3B/7B calibration avoids repeatedly re-calibrating nearly
-        # identical serving shapes in a short 200-request experiment.
-        if model_b > 7.0:
-            model_bucket = "large"
-        elif model_b >= 3.0:
-            model_bucket = "medium"
-        else:
-            model_bucket = "small"
-    elif model_b <= 4.5:
-        model_bucket = "3b"
-    elif model_b <= 10.0:
-        model_bucket = "7b"
-    elif model_b <= 20.0:
-        model_bucket = "14b"
+    # Coarse buckets are deliberate: the best controller pools calibration
+    # across nearby model sizes instead of repeatedly re-calibrating short
+    # serving runs.
+    if model_b > 7.0:
+        model_bucket = "large"
+    elif model_b >= 3.0:
+        model_bucket = "medium"
     else:
-        model_bucket = "gt14b"
+        model_bucket = "small"
 
     if prefill_ratio >= 0.70:
         phase_bucket = "prefill"
@@ -632,12 +399,6 @@ def extract_adaptive_ubatch_features(
     *,
     model_config: Any,
     num_scheduled_tokens: np.ndarray | list[int],
-    waiting_count: int = 0,
-    running_count: int = 0,
-    oldest_wait_ms: float = 0.0,
-    pending_first_token_count: int = 0,
-    oldest_first_token_wait_ms: float = 0.0,
-    pending_prefill_tokens: int = 0,
 ) -> AdaptiveUBatchFeatures:
     (
         total,
@@ -674,18 +435,6 @@ def extract_adaptive_ubatch_features(
         avg_tokens_per_req=avg_tokens,
         model_billions=model_b,
         hidden_size=hidden_size,
-        waiting_count=max(0, int(waiting_count)),
-        running_count=max(0, int(running_count)),
-        oldest_wait_ms=max(0.0, float(oldest_wait_ms)),
-        pending_first_token_count=max(
-            0,
-            int(pending_first_token_count),
-        ),
-        oldest_first_token_wait_ms=max(
-            0.0,
-            float(oldest_first_token_wait_ms),
-        ),
-        pending_prefill_tokens=max(0, int(pending_prefill_tokens)),
         bucket_key=_bucketize_features(
             model_b=model_b,
             total=total,
@@ -1148,30 +897,12 @@ class AdaptiveUBatchController:
         risk_kappa = float(
             getattr(self.parallel_config, "adaptive_ubatch_risk_kappa", 1.0)
         )
-        queue_guard_enabled = bool(
-            getattr(
-                self.parallel_config,
-                "adaptive_ubatch_enable_queue_guard",
-                False,
-            )
-        )
         max_uncertainty_ratio = float(
             getattr(
                 self.parallel_config,
                 "adaptive_ubatch_max_uncertainty_ratio",
                 0.15,
             )
-        )
-        safe_state = self._lookup_state(bucket, safe_m)
-        pressure_target = max(
-            2,
-            int(
-                getattr(
-                    self.parallel_config,
-                    "adaptive_ubatch_candidate_calibration_observations",
-                    3,
-                )
-            ),
         )
         scores: list[CandidateScore] = []
         for m in candidates:
@@ -1199,41 +930,6 @@ class AdaptiveUBatchController:
                 else 0.0
             )
             robust = calibrated + (risk_kappa * uncertainty if risk_enabled else 0.0)
-            queue_progress = (
-                state.ewma_queue_progress
-                if state.pressure_count > 0
-                else None
-            )
-            first_token_rate = (
-                state.ewma_first_token_rate
-                if state.pressure_count > 0
-                else None
-            )
-            queue_penalty_ms = 0.0
-            if (
-                queue_guard_enabled
-                and m != safe_m
-                and state.pressure_count >= pressure_target
-            ):
-                if safe_state.pressure_count >= pressure_target:
-                    progress_regret = max(
-                        0.0,
-                        safe_state.ewma_queue_progress
-                        - state.ewma_queue_progress,
-                    )
-                else:
-                    # Before the safe reference is pressure-calibrated, only
-                    # penalize a candidate that is actively accumulating
-                    # queue pressure.
-                    progress_regret = max(
-                        0.0,
-                        -state.ewma_queue_progress,
-                    )
-                queue_penalty_ms = calibrated * min(
-                    0.50,
-                    0.25 * progress_regret,
-                )
-                robust += queue_penalty_ms
             rejected = False
             rejection_reason = None
             if risk_enabled:
@@ -1259,10 +955,6 @@ class AdaptiveUBatchController:
                 uncertainty_ms=uncertainty,
                 robust_cost_ms=robust,
                 count=state.count,
-                queue_progress=queue_progress,
-                first_token_rate=first_token_rate,
-                queue_penalty_ms=queue_penalty_ms,
-                pressure_count=state.pressure_count,
                 last_update_step=state.last_update_step,
                 rejected=rejected,
                 rejection_reason=rejection_reason,
@@ -1422,15 +1114,6 @@ class AdaptiveUBatchController:
             bucket_state.current_m = effective_m
             bucket_state.pending_m = None
             bucket_state.pending_wins = 0
-            if effective_m == int(
-                getattr(
-                    self.parallel_config,
-                    "adaptive_ubatch_safe_m",
-                    1,
-                )
-            ):
-                bucket_state.probation_m = None
-                bucket_state.probation_observations_left = 0
             if switched:
                 self._last_change_step = self._step_id
                 bucket_state.last_change_step = self._step_id
@@ -1449,17 +1132,6 @@ class AdaptiveUBatchController:
                 fallback=decision.fallback if fallback is None else fallback,
                 decision_overhead_us=decision.decision_overhead_us,
                 candidate_scores=decision.candidate_scores,
-                waiting_count=decision.waiting_count,
-                running_count=decision.running_count,
-                oldest_wait_ms=decision.oldest_wait_ms,
-                pending_first_token_count=(
-                    decision.pending_first_token_count
-                ),
-                oldest_first_token_wait_ms=(
-                    decision.oldest_first_token_wait_ms
-                ),
-                pending_prefill_tokens=decision.pending_prefill_tokens,
-                probation=decision.probation,
             )
 
     def observe_rejection(
@@ -1507,13 +1179,6 @@ class AdaptiveUBatchController:
     def select(
         self,
         num_scheduled_tokens: np.ndarray | list[int],
-        *,
-        waiting_count: int = 0,
-        running_count: int = 0,
-        oldest_wait_ms: float = 0.0,
-        pending_first_token_count: int = 0,
-        oldest_first_token_wait_ms: float = 0.0,
-        pending_prefill_tokens: int = 0,
     ) -> AdaptiveUBatchDecision:
         start_ns = time.perf_counter_ns()
         with self._lock:
@@ -1521,12 +1186,6 @@ class AdaptiveUBatchController:
             features = extract_adaptive_ubatch_features(
                 model_config=self.model_config,
                 num_scheduled_tokens=num_scheduled_tokens,
-                waiting_count=waiting_count,
-                running_count=running_count,
-                oldest_wait_ms=oldest_wait_ms,
-                pending_first_token_count=pending_first_token_count,
-                oldest_first_token_wait_ms=oldest_first_token_wait_ms,
-                pending_prefill_tokens=pending_prefill_tokens,
             )
             bucket = WorkloadBucket.from_key(features.bucket_key)
             if self._last_bucket == bucket:
@@ -1568,16 +1227,6 @@ class AdaptiveUBatchController:
                             count=calibration.count,
                         ).to_payload(),
                     ),
-                    waiting_count=features.waiting_count,
-                    running_count=features.running_count,
-                    oldest_wait_ms=features.oldest_wait_ms,
-                    pending_first_token_count=(
-                        features.pending_first_token_count
-                    ),
-                    oldest_first_token_wait_ms=(
-                        features.oldest_first_token_wait_ms
-                    ),
-                    pending_prefill_tokens=features.pending_prefill_tokens,
                 )
                 self._write_trace({
                     "type": "adaptive_ubatch_ineligible",
@@ -1597,18 +1246,6 @@ class AdaptiveUBatchController:
                         "decode_reqs": features.decode_reqs,
                         "prefill_ratio": features.prefill_ratio,
                         "model_billions": features.model_billions,
-                        "waiting_count": features.waiting_count,
-                        "running_count": features.running_count,
-                        "oldest_wait_ms": features.oldest_wait_ms,
-                        "pending_first_token_count": (
-                            features.pending_first_token_count
-                        ),
-                        "oldest_first_token_wait_ms": (
-                            features.oldest_first_token_wait_ms
-                        ),
-                        "pending_prefill_tokens": (
-                            features.pending_prefill_tokens
-                        ),
                     },
                 })
                 return decision
@@ -1632,16 +1269,6 @@ class AdaptiveUBatchController:
                     previous_m=bucket_state.current_m,
                     switched=decision.num_ubatches != bucket_state.current_m,
                     decision_overhead_us=(time.perf_counter_ns() - start_ns) / 1000.0,
-                    waiting_count=features.waiting_count,
-                    running_count=features.running_count,
-                    oldest_wait_ms=features.oldest_wait_ms,
-                    pending_first_token_count=(
-                        features.pending_first_token_count
-                    ),
-                    oldest_first_token_wait_ms=(
-                        features.oldest_first_token_wait_ms
-                    ),
-                    pending_prefill_tokens=features.pending_prefill_tokens,
                 )
 
             candidates = _candidate_ms(
@@ -1683,31 +1310,6 @@ class AdaptiveUBatchController:
                 selected = current_score
                 reason = "all_candidates_rejected"
                 fallback = True
-            elif (
-                not _best_policy_profile_enabled()
-                and bucket_state.probation_m == previous_m
-                and previous_m != safe_m
-                and bucket_state.probation_observations_left > 0
-            ):
-                # Once promoted, measure the candidate on consecutive
-                # comparable steps. Do not let unrelated candidate
-                # calibration interrupt the safety observation window.
-                selected = current_score
-                reason = "candidate_probation"
-            elif (
-                not _best_policy_profile_enabled()
-                and bucket_state.safe_refresh_required
-            ):
-                safe_score = next(
-                    (
-                        score
-                        for score in valid_scores
-                        if score.m == safe_m
-                    ),
-                    None,
-                )
-                selected = safe_score or current_score
-                reason = "paired_safe_refresh"
             else:
                 safe_score = next(
                     (
@@ -1717,48 +1319,7 @@ class AdaptiveUBatchController:
                     ),
                     None,
                 )
-                revalidation_enabled = bool(
-                    getattr(
-                        self.parallel_config,
-                        "adaptive_ubatch_enable_exploration",
-                        False,
-                    )
-                )
-                revalidation_interval = max(
-                    1,
-                    int(
-                        getattr(
-                            self.parallel_config,
-                            "adaptive_ubatch_exploration_interval_steps",
-                            64,
-                        )
-                        or 64
-                    ),
-                )
-                safe_state = self._lookup_state(bucket, safe_m)
-                safe_reference_stale = (
-                    previous_m != safe_m
-                    and safe_score is not None
-                    and safe_state.count > 0
-                    and (
-                        self._step_id - safe_state.last_update_step
-                        >= revalidation_interval
-                    )
-                )
-                if (
-                    not _best_policy_profile_enabled()
-                    and revalidation_enabled
-                    and safe_reference_stale
-                ):
-                    # Periodically pair an active M>1 policy with a current M=1
-                    # sample. This detects QPS/load drift without permanently
-                    # including QPS in the bucket key.
-                    selected = safe_score
-                    reason = "periodic_safe_refresh"
-                    bucket_state.pending_m = None
-                    bucket_state.pending_wins = 0
-                else:
-                    selected = None
+                selected = None
                 calibration_target = max(
                     0,
                     int(
@@ -1826,28 +1387,6 @@ class AdaptiveUBatchController:
                                 ),
                             ),
                         )
-                        pressure_ratio = features.waiting_count / max(
-                            1,
-                            features.num_reqs,
-                        )
-                        pressure_extra_gain = min(
-                            6.0,
-                            pressure_ratio * 2.0
-                            + min(features.oldest_wait_ms / 1000.0, 2.0),
-                        )
-                        required_safe_gain = (
-                            min_gain + pressure_extra_gain
-                            if bool(
-                                getattr(
-                                    self.parallel_config,
-                                    "adaptive_ubatch_enable_queue_guard",
-                                    False,
-                                )
-                            )
-                            and features.waiting_count > 0
-                            and best.m != safe_m
-                            else min_gain
-                        )
                         safe_gain_pct = None
                         if (
                             safe_score is not None
@@ -1864,109 +1403,18 @@ class AdaptiveUBatchController:
                         if (
                             safe_score is not None
                             and safe_gain_pct is not None
-                            and safe_gain_pct < required_safe_gain
+                            and safe_gain_pct < min_gain
                         ):
                             # The safe candidate is the explicit online
                             # reference. A non-safe M must beat it by the full
                             # switch margin; a marginal win is not enough to
                             # pay adaptive split/communication overhead.
                             selected = safe_score
-                            reason = (
-                                "queue_pressure_gain_guard"
-                                if required_safe_gain > min_gain
-                                else "safe_m_gain_guard"
-                            )
+                            reason = "safe_m_gain_guard"
                             bucket_state.pending_m = None
                             bucket_state.pending_wins = 0
                         else:
                             selected = best
-                        if (
-                            bool(
-                                getattr(
-                                    self.parallel_config,
-                                    "adaptive_ubatch_enable_queue_guard",
-                                    False,
-                                )
-                            )
-                            and selected.m != safe_m
-                            and safe_score is not None
-                        ):
-                            selected_state = self._lookup_state(
-                                bucket,
-                                selected.m,
-                            )
-                            safe_state = self._lookup_state(
-                                bucket,
-                                safe_m,
-                            )
-                            progress_target = max(
-                                2,
-                                calibration_target,
-                            )
-                            progress_tolerance = max(
-                                0.02,
-                                float(
-                                    getattr(
-                                        self.parallel_config,
-                                        (
-                                            "adaptive_ubatch_"
-                                            "max_exploration_regret_pct"
-                                        ),
-                                        5.0,
-                                    )
-                                )
-                                / 100.0,
-                            )
-                            if (
-                                selected_state.pressure_count
-                                >= progress_target
-                                and safe_state.pressure_count
-                                >= progress_target
-                            ):
-                                queue_regret = (
-                                    safe_state.ewma_queue_progress
-                                    - selected_state.ewma_queue_progress
-                                )
-                                rate_regret = 0.0
-                                if safe_state.ewma_first_token_rate > 0:
-                                    rate_regret = (
-                                        safe_state.ewma_first_token_rate
-                                        - selected_state.ewma_first_token_rate
-                                    ) / max(
-                                        safe_state.ewma_first_token_rate,
-                                        1e-6,
-                                    )
-                                request_regressed = (
-                                    rate_regret > progress_tolerance
-                                    or queue_regret
-                                    > 2.0 * progress_tolerance
-                                )
-                                if request_regressed:
-                                    selected = safe_score
-                                    reason = (
-                                        "request_progress_promotion_guard"
-                                    )
-                                    self._cooldown_until[
-                                        (bucket.as_tuple(), best.m)
-                                    ] = (
-                                        self._step_id
-                                        + max(
-                                            64,
-                                            int(
-                                                getattr(
-                                                    self.parallel_config,
-                                                    (
-                                                        "adaptive_ubatch_"
-                                                        "failure_cooldown_steps"
-                                                    ),
-                                                    32,
-                                                )
-                                            )
-                                            * 4,
-                                        )
-                                    )
-                                    bucket_state.pending_m = None
-                                    bucket_state.pending_wins = 0
                         min_hold = int(
                             getattr(
                                 self.parallel_config,
@@ -1974,11 +1422,7 @@ class AdaptiveUBatchController:
                                 4,
                             )
                         )
-                        if reason in {
-                            "safe_m_gain_guard",
-                            "queue_pressure_gain_guard",
-                            "request_progress_promotion_guard",
-                        }:
+                        if reason == "safe_m_gain_guard":
                             # Safety fallback bypasses hold/confirmation so a
                             # marginal non-safe choice cannot linger.
                             pass
@@ -2046,33 +1490,6 @@ class AdaptiveUBatchController:
                 bucket_state.current_m = selected_m
                 bucket_state.pending_m = None
                 bucket_state.pending_wins = 0
-                if (
-                    not _best_policy_profile_enabled()
-                    and selected_m != safe_m
-                    and reason
-                    not in {
-                        "candidate_calibration",
-                        "controlled_exploration",
-                        "paired_safe_refresh",
-                    }
-                ):
-                    bucket_state.probation_m = selected_m
-                    bucket_state.probation_observations_left = max(
-                        2,
-                        int(
-                            getattr(
-                                self.parallel_config,
-                                (
-                                    "adaptive_ubatch_"
-                                    "exploration_stable_steps"
-                                ),
-                                8,
-                            )
-                        ),
-                    )
-                else:
-                    bucket_state.probation_m = None
-                    bucket_state.probation_observations_left = 0
             else:
                 self._current_m = previous_m
                 bucket_state.current_m = previous_m
@@ -2093,21 +1510,6 @@ class AdaptiveUBatchController:
                 fallback=fallback,
                 decision_overhead_us=overhead_us,
                 candidate_scores=tuple(s.to_payload() for s in scores),
-                waiting_count=features.waiting_count,
-                running_count=features.running_count,
-                oldest_wait_ms=features.oldest_wait_ms,
-                pending_first_token_count=(
-                    features.pending_first_token_count
-                ),
-                oldest_first_token_wait_ms=(
-                    features.oldest_first_token_wait_ms
-                ),
-                pending_prefill_tokens=features.pending_prefill_tokens,
-                probation=(
-                    bucket_state.probation_m == selected_m
-                    and selected_m != safe_m
-                    and bucket_state.probation_observations_left > 0
-                ),
             )
             self._write_trace({
                 "type": "adaptive_ubatch_decision",
@@ -2122,18 +1524,6 @@ class AdaptiveUBatchController:
                     "decode_reqs": features.decode_reqs,
                     "prefill_ratio": features.prefill_ratio,
                     "model_billions": features.model_billions,
-                    "waiting_count": features.waiting_count,
-                    "running_count": features.running_count,
-                    "oldest_wait_ms": features.oldest_wait_ms,
-                    "pending_first_token_count": (
-                        features.pending_first_token_count
-                    ),
-                    "oldest_first_token_wait_ms": (
-                        features.oldest_first_token_wait_ms
-                    ),
-                    "pending_prefill_tokens": (
-                        features.pending_prefill_tokens
-                    ),
                 },
                 "previous_m": previous_m,
                 "selected_m": selected_m,
@@ -2143,10 +1533,6 @@ class AdaptiveUBatchController:
                 "reason": reason,
                 "pending_m": bucket_state.pending_m,
                 "pending_wins": bucket_state.pending_wins,
-                "probation": decision.probation,
-                "probation_observations_left": (
-                    bucket_state.probation_observations_left
-                ),
                 "candidates": list(decision.candidate_scores),
                 "decision_overhead_us": overhead_us,
             })
@@ -2157,13 +1543,6 @@ class AdaptiveUBatchController:
         decision: AdaptiveUBatchDecision,
         *,
         forward_ms: float,
-        next_waiting_count: int | None = None,
-        next_running_count: int | None = None,
-        next_oldest_wait_ms: float | None = None,
-        next_pending_first_token_count: int | None = None,
-        next_oldest_first_token_wait_ms: float | None = None,
-        next_pending_prefill_tokens: int | None = None,
-        completed_first_token_count: int | None = None,
     ) -> None:
         with self._lock:
             if decision is None:
@@ -2229,31 +1608,6 @@ class AdaptiveUBatchController:
                 step_id=self._step_id,
                 alpha=alpha,
             )
-            (
-                queue_progress,
-                queue_stalled,
-                first_token_rate,
-            ) = _queue_progress_score(
-                decision,
-                actual_ms=actual_ms,
-                next_waiting_count=next_waiting_count,
-                next_running_count=next_running_count,
-                next_oldest_wait_ms=next_oldest_wait_ms,
-                next_pending_first_token_count=(
-                    next_pending_first_token_count
-                ),
-                next_oldest_first_token_wait_ms=(
-                    next_oldest_first_token_wait_ms
-                ),
-                next_pending_prefill_tokens=next_pending_prefill_tokens,
-                completed_first_token_count=completed_first_token_count,
-            )
-            if queue_progress is not None:
-                selected_state.update_queue_progress(
-                    queue_progress=queue_progress,
-                    first_token_rate=first_token_rate,
-                    alpha=alpha,
-                )
             degradation_pct = error_ms / max(predicted_ms, 1e-6) * 100.0
             bad_threshold = float(
                 getattr(self.parallel_config, "adaptive_ubatch_bad_threshold_pct", 8.0)
@@ -2282,24 +1636,8 @@ class AdaptiveUBatchController:
             )
             selected_state = self._lookup_state(bucket, m)
             safe_state = self._lookup_state(bucket, safe_m)
-            if (
-                not _best_policy_profile_enabled()
-                and m != safe_m
-                and decision.reason == "candidate_calibration"
-                and selected_state.count >= accepted_target
-            ):
-                bucket_state.safe_refresh_required = True
-                bucket_state.validating_m = m
-            elif (
-                m == safe_m
-                and bucket_state.safe_refresh_required
-            ):
-                bucket_state.safe_refresh_required = False
-                bucket_state.validating_m = None
             relative_safe_regret_pct = None
             bad_vs_safe = False
-            queue_progress_regret = None
-            bad_queue_progress = False
             if (
                 m != safe_m
                 and safe_candidate is not None
@@ -2338,72 +1676,13 @@ class AdaptiveUBatchController:
                     bad_vs_safe = (
                         relative_safe_regret_pct > regret_threshold
                     )
-            pressure_target = max(2, accepted_target)
-            queue_guard_enabled = bool(
-                getattr(
-                    self.parallel_config,
-                    "adaptive_ubatch_enable_queue_guard",
-                    False,
-                )
-            )
-            progress_regret_threshold = max(
-                0.02,
-                float(
-                    getattr(
-                        self.parallel_config,
-                        "adaptive_ubatch_max_exploration_regret_pct",
-                        5.0,
-                    )
-                )
-                / 100.0,
-            )
-            if (
-                queue_guard_enabled
-                and m != safe_m
-                and selected_state.pressure_count >= pressure_target
-            ):
-                if safe_state.pressure_count >= pressure_target:
-                    queue_progress_regret = (
-                        safe_state.ewma_queue_progress
-                        - selected_state.ewma_queue_progress
-                    )
-                    first_token_rate_regret = 0.0
-                    if safe_state.ewma_first_token_rate > 0:
-                        first_token_rate_regret = (
-                            safe_state.ewma_first_token_rate
-                            - selected_state.ewma_first_token_rate
-                        ) / max(
-                            safe_state.ewma_first_token_rate,
-                            1e-6,
-                        )
-                    bad_queue_progress = (
-                        queue_progress_regret
-                        > 2.0 * progress_regret_threshold
-                        or first_token_rate_regret
-                        > progress_regret_threshold
-                    )
-                else:
-                    bad_queue_progress = (
-                        selected_state.ewma_queue_progress
-                        < -2.0 * progress_regret_threshold
-                    )
-            if queue_guard_enabled and queue_stalled and m != safe_m:
-                bucket_state.queue_stall_streak += 1
-            else:
-                bucket_state.queue_stall_streak = 0
-            repeated_queue_stall = bucket_state.queue_stall_streak >= 2
             enough_observations = prior_state_count >= self._min_observations()
             bad_execution = (
                 has_alternative
                 and enough_observations
                 and degradation_pct > bad_threshold
             )
-            bad_non_safe = (
-                bad_execution
-                or bad_vs_safe
-                or bad_queue_progress
-                or repeated_queue_stall
-            )
+            bad_non_safe = bad_execution or bad_vs_safe
             if bad_non_safe and m != safe_m:
                 bucket_state.bad_streak += 1
                 self._cooldown_until[(bucket.as_tuple(), m)] = (
@@ -2423,11 +1702,7 @@ class AdaptiveUBatchController:
                             )
                             * 4,
                         )
-                        if (
-                            bad_vs_safe
-                            or bad_queue_progress
-                            or repeated_queue_stall
-                        )
+                        if bad_vs_safe
                         else int(
                             getattr(
                                 self.parallel_config,
@@ -2437,27 +1712,13 @@ class AdaptiveUBatchController:
                         )
                     )
                 )
-                if (
-                    bad_vs_safe
-                    or bad_queue_progress
-                    or repeated_queue_stall
-                ):
+                if bad_vs_safe:
                     self._current_m = safe_m
                     bucket_state.current_m = safe_m
                     bucket_state.pending_m = None
                     bucket_state.pending_wins = 0
-                    bucket_state.probation_m = None
-                    bucket_state.probation_observations_left = 0
             else:
                 bucket_state.bad_streak = 0
-                if (
-                    m != safe_m
-                    and bucket_state.probation_m == m
-                    and bucket_state.probation_observations_left > 0
-                ):
-                    bucket_state.probation_observations_left -= 1
-                    if bucket_state.probation_observations_left <= 0:
-                        bucket_state.probation_m = None
             self._write_trace({
                 "type": "adaptive_ubatch_observation",
                 "step_id": self._step_id,
@@ -2472,43 +1733,10 @@ class AdaptiveUBatchController:
                 "bad_execution": bad_execution,
                 "relative_safe_regret_pct": relative_safe_regret_pct,
                 "bad_vs_safe": bad_vs_safe,
-                "queue_progress": queue_progress,
-                "first_token_rate": first_token_rate,
-                "completed_first_token_count": (
-                    completed_first_token_count
-                ),
-                "queue_progress_ewma": (
-                    selected_state.ewma_queue_progress
-                    if selected_state.pressure_count > 0
-                    else None
-                ),
-                "queue_progress_regret": queue_progress_regret,
-                "progress_regret_threshold": (
-                    progress_regret_threshold
-                ),
-                "queue_stalled": queue_stalled,
-                "queue_stall_streak": bucket_state.queue_stall_streak,
-                "bad_queue_progress": bad_queue_progress,
-                "next_waiting_count": next_waiting_count,
-                "next_running_count": next_running_count,
-                "next_oldest_wait_ms": next_oldest_wait_ms,
-                "next_pending_first_token_count": (
-                    next_pending_first_token_count
-                ),
-                "next_oldest_first_token_wait_ms": (
-                    next_oldest_first_token_wait_ms
-                ),
-                "next_pending_prefill_tokens": (
-                    next_pending_prefill_tokens
-                ),
                 "has_alternative": has_alternative,
                 "enough_observations": enough_observations,
                 "affects_cooldown": (
                     bad_non_safe and m != safe_m
-                ),
-                "probation": decision.probation,
-                "probation_observations_left": (
-                    bucket_state.probation_observations_left
                 ),
             })
 
@@ -2545,8 +1773,6 @@ class AdaptiveUBatchController:
             bucket_state.current_m = safe_m
             bucket_state.pending_m = None
             bucket_state.pending_wins = 0
-            bucket_state.probation_m = None
-            bucket_state.probation_observations_left = 0
             self._write_trace({
                 "type": "adaptive_ubatch_runtime_failure",
                 "step_id": self._step_id,
