@@ -1,0 +1,52 @@
+INFO 07-29 12:15:21 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 07-29 12:15:21 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 07-29 12:15:21 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 07-29 12:15:21 [__init__.py:238] Platform plugin ascend is activated
+2026-07-29 12:15:24,592 - 183092 - ServiceProfiler - INFO - VLLM_USE_V1 not set, auto-detected via vLLM 0.20.2+empty: default 1
+INFO 07-29 12:15:24 [importing.py:44] Triton is installed but 0 active driver(s) found (expected 1). Disabling Triton to prevent runtime errors.
+INFO 07-29 12:15:24 [importing.py:68] Triton not installed or not compatible; certain GPU-related functions will not be available.
+INFO 07-29 12:15:24 [nixl_utils.py:20] Setting UCX_RCACHE_MAX_UNRELEASED to '1024' to avoid a rare memory leak in UCX when using NIXL.
+WARNING 07-29 12:15:24 [nixl_utils.py:34] NIXL is not available
+WARNING 07-29 12:15:24 [nixl_utils.py:44] NIXL agent config is not available
+WARNING 07-29 12:15:24 [registry.py:945] Model architecture DeepseekV4ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v4:AscendDeepseekV4ForCausalLM.
+WARNING 07-29 12:15:24 [registry.py:945] Model architecture DeepSeekV4MTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v4_mtp:DeepSeekV4MTP.
+INFO 07-29 12:15:24 [__init__.py:110] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+INFO 07-29 12:15:24 [__init__.py:110] Registered model loader `<class 'vllm_ascend.model_loader.rfork.rfork_loader.RForkModelLoader'>` with load format `rfork`
+WARNING 07-29 12:15:25 [__init__.py:87] The quantization method 'ascend' already exists and will be overwritten by the quantization config <class 'vllm_ascend._310p.quantization.modelslim_config.AscendModelSlimConfig310'>.
+2026-07-29 12:15:26,031 - modelscope - INFO - Target directory already exists, skipping creation.
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7f0e40a53920>, trust_remote_code=False, seed=0, num_prompts=200, dataset_name='custom', no_stream=False, dataset_path='/workspace/DATASET/vllm_custom/gov_report_gao_1K.jsonl', no_oversample=False, skip_chat_template=True, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=128, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=1024, random_output_len=128, random_range_ratio='0.0', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='vllm', base_url=None, host='127.0.0.1', port=8000, endpoint='/v1/completions', header=None, max_concurrency=None, model='Qwen/Qwen2.5-3B', input_len=None, output_len=None, tokenizer=None, tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=2.34179515, burstiness=1.0, disable_tqdm=False, num_warmups=0, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, power_metrics_file=None, ignore_eos=True, percentile_metrics=None, metric_percentiles='99', goodput=None, request_id_prefix='bench-d8f089df-', top_p=None, top_k=None, min_p=None, temperature=0.0, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+Downloading Model from https://www.modelscope.cn to directory: /root/.cache/modelscope/hub/models/Qwen/Qwen2.5-3B
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Starting main benchmark run...
+Traffic request rate: 2.34179515
+Burstiness factor: 1.0 (Poisson process)
+Maximum request concurrency: None
+  0%|          | 0/200 [00:00<?, ?it/s]  0%|          | 1/200 [01:31<5:02:10, 91.11s/it]  1%|          | 2/200 [01:31<2:04:09, 37.62s/it]  2%|▏         | 3/200 [01:31<1:07:22, 20.52s/it]  3%|▎         | 6/200 [01:31<22:34,  6.98s/it]    4%|▍         | 9/200 [01:31<11:30,  3.62s/it]  6%|▌         | 11/200 [01:32<07:52,  2.50s/it]  6%|▋         | 13/200 [01:32<05:27,  1.75s/it]  8%|▊         | 15/200 [01:32<03:54,  1.27s/it]  9%|▉         | 18/200 [01:32<02:23,  1.27it/s] 10%|█         | 20/200 [01:33<01:49,  1.65it/s] 11%|█         | 22/200 [01:35<02:19,  1.27it/s] 12%|█▏        | 23/200 [01:35<02:00,  1.46it/s] 12%|█▏        | 24/200 [01:35<01:45,  1.66it/s] 13%|█▎        | 26/200 [01:36<01:15,  2.31it/s] 14%|█▍        | 28/200 [01:36<01:11,  2.41it/s] 14%|█▍        | 29/200 [01:37<01:05,  2.62it/s] 16%|█▌        | 31/200 [01:37<00:46,  3.64it/s] 16%|█▌        | 32/200 [01:37<00:42,  3.94it/s] 16%|█▋        | 33/200 [01:37<00:39,  4.26it/s] 18%|█▊        | 36/200 [01:37<00:23,  6.84it/s] 19%|█▉        | 38/200 [01:38<00:20,  7.93it/s] 20%|██        | 40/200 [01:39<00:42,  3.75it/s] 20%|██        | 41/200 [01:39<00:39,  4.03it/s] 22%|██▏       | 43/200 [01:39<00:29,  5.24it/s] 22%|██▎       | 45/200 [01:39<00:24,  6.44it/s] 24%|██▍       | 48/200 [01:39<00:17,  8.83it/s] 26%|██▌       | 51/200 [01:39<00:13, 10.96it/s] 26%|██▋       | 53/200 [01:40<00:15,  9.20it/s] 28%|██▊       | 55/200 [01:40<00:14,  9.96it/s] 29%|██▉       | 58/200 [01:40<00:11, 11.98it/s] 30%|███       | 61/200 [01:40<00:10, 13.70it/s] 32%|███▏      | 64/200 [01:40<00:09, 14.98it/s] 34%|███▎      | 67/200 [01:41<00:08, 16.12it/s] 35%|███▌      | 70/200 [01:41<00:07, 17.07it/s] 36%|███▋      | 73/200 [01:41<00:09, 14.03it/s] 38%|███▊      | 75/200 [01:41<00:11, 11.24it/s] 38%|███▊      | 77/200 [01:41<00:10, 11.73it/s] 40%|███▉      | 79/200 [01:42<00:10, 12.09it/s] 40%|████      | 81/200 [01:42<00:09, 12.78it/s] 42%|████▏     | 84/200 [01:42<00:07, 14.88it/s] 44%|████▎     | 87/200 [01:42<00:06, 16.49it/s] 45%|████▌     | 90/200 [01:42<00:06, 17.81it/s] 46%|████▋     | 93/200 [01:42<00:05, 18.80it/s] 48%|████▊     | 96/200 [01:42<00:05, 19.19it/s] 50%|████▉     | 99/200 [01:43<00:05, 19.85it/s] 51%|█████     | 102/200 [01:43<00:04, 20.48it/s] 52%|█████▎    | 105/200 [01:43<00:04, 20.85it/s] 54%|█████▍    | 108/200 [01:43<00:04, 21.27it/s] 56%|█████▌    | 111/200 [01:43<00:04, 21.71it/s] 57%|█████▋    | 114/200 [01:43<00:03, 22.07it/s] 58%|█████▊    | 117/200 [01:43<00:03, 22.38it/s] 60%|██████    | 120/200 [01:44<00:03, 22.76it/s] 62%|██████▏   | 123/200 [01:44<00:07,  9.87it/s] 62%|██████▎   | 125/200 [01:45<00:08,  9.29it/s] 64%|██████▎   | 127/200 [01:45<00:07, 10.16it/s] 66%|██████▌   | 131/200 [01:45<00:04, 14.09it/s] 67%|██████▋   | 134/200 [01:45<00:04, 16.20it/s] 68%|██████▊   | 137/200 [01:45<00:03, 18.10it/s] 70%|███████   | 140/200 [01:45<00:03, 19.77it/s] 72%|███████▏  | 143/200 [01:45<00:02, 21.19it/s] 73%|███████▎  | 146/200 [01:45<00:02, 22.47it/s] 74%|███████▍  | 149/200 [01:45<00:02, 23.50it/s] 76%|███████▌  | 152/200 [01:47<00:06,  7.18it/s] 77%|███████▋  | 154/200 [01:47<00:05,  8.28it/s] 78%|███████▊  | 156/200 [01:47<00:04,  9.54it/s] 79%|███████▉  | 158/200 [01:47<00:03, 10.87it/s] 80%|████████  | 161/200 [01:47<00:02, 13.85it/s] 82%|████████▏ | 164/200 [01:47<00:02, 16.69it/s] 84%|████████▎ | 167/200 [01:48<00:03,  9.65it/s] 84%|████████▍ | 169/200 [01:48<00:02, 10.89it/s] 86%|████████▌ | 172/200 [01:48<00:02, 13.73it/s] 88%|████████▊ | 175/200 [01:48<00:01, 16.57it/s] 89%|████████▉ | 178/200 [01:48<00:01, 19.08it/s] 90%|█████████ | 181/200 [01:48<00:00, 21.52it/s] 93%|█████████▎| 186/200 [01:48<00:00, 25.54it/s] 95%|█████████▌| 190/200 [01:49<00:00, 26.24it/s] 97%|█████████▋| 194/200 [01:49<00:00, 26.95it/s]100%|█████████▉| 199/200 [01:49<00:00, 29.96it/s]100%|██████████| 200/200 [01:49<00:00,  1.83it/s]
+tip: install termplotlib and gnuplot to plot the metrics
+============ Serving Benchmark Result ============
+Successful requests:                     200       
+Failed requests:                         0         
+Request rate configured (RPS):           2.34      
+Benchmark duration (s):                  109.34    
+Total input tokens:                      262240    
+Total generated tokens:                  25600     
+Request throughput (req/s):              1.83      
+Output token throughput (tok/s):         234.12    
+Peak output token throughput (tok/s):    1078.00   
+Peak concurrent requests:                200.00    
+Total token throughput (tok/s):          2632.44   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          2317.89   
+Median TTFT (ms):                        2206.95   
+P99 TTFT (ms):                           5180.80   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          448.42    
+Median TPOT (ms):                        466.88    
+P99 TPOT (ms):                           690.23    
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           448.42    
+Median ITL (ms):                         171.25    
+P99 ITL (ms):                            1409.71   
+==================================================
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute

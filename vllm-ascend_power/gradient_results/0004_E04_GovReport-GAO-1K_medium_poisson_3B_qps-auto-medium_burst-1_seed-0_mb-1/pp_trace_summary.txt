@@ -1,0 +1,38 @@
+Trace file: /workspace/vllm_ascend_pp_trace.jsonl
+Rank timelines: 1852
+Dual PP metrics: 926
+
+Dual-card PP summary
+  steps              : 921 (step 898..1818)
+  tokens range       : 1..2048
+  makespan avg/p50/p95:  291.026 ms /  182.446 ms /  941.062 ms
+  bubble ratio avg/p50/p95:   67.74% /   68.50% /   78.87%
+  compute overlap avg/max:    0.00% /    0.00%
+  compute util avg rank0/rank1:   32.64% /   31.89%
+  active util avg rank0/rank1 :   35.72% /   99.93%
+  compute ms avg rank0/rank1  :  105.705 ms /  104.479 ms
+  verdict            : low/no compute overlap; this is not micro-batch pipeline overlap.
+
+Stage duration averages
+  PP rank 0:
+    worker.model_runner_execute      avg= 111.827 ms p95= 423.553 ms n=926
+    runner.forward.microbatch.0      avg= 105.512 ms p95= 413.064 ms n=926
+    runner.prepare_input             avg=   3.110 ms p95=   5.456 ms n=926
+    runner.send.microbatch.0         avg=   2.658 ms p95=   4.480 ms n=926
+    runner.preprocess                avg=   0.015 ms p95=   0.022 ms n=926
+    worker.sample_tokens             avg=   0.007 ms p95=   0.011 ms n=926
+    runner.post_process              avg=   0.002 ms p95=   0.004 ms n=926
+    worker.wait_prev_pp_send         avg=   0.002 ms p95=   0.003 ms n=801
+    runner.recv.microbatch.0         avg=   0.001 ms p95=   0.001 ms n=926
+  PP rank 1:
+    worker.model_runner_execute      avg= 221.197 ms p95= 840.275 ms n=926
+    runner.recv.microbatch.0         avg= 109.394 ms p95= 418.988 ms n=926
+    runner.forward.microbatch.0      avg= 104.285 ms p95= 412.979 ms n=926
+    worker.sample_tokens             avg=  68.945 ms p95= 145.163 ms n=926
+    runner.sample                    avg=  68.307 ms p95= 143.979 ms n=926
+    runner.post_process              avg=   3.923 ms p95=   4.323 ms n=926
+    runner.prepare_input             avg=   3.099 ms p95=   5.445 ms n=926
+    runner.bookkeeping               avg=   0.266 ms p95=   0.373 ms n=926
+    runner.preprocess                avg=   0.138 ms p95=   0.203 ms n=926
+    runner.draft_token               avg=   0.001 ms p95=   0.001 ms n=926
+

@@ -1,0 +1,41 @@
+Trace file: /workspace/vllm_ascend_pp_trace.jsonl
+Rank timelines: 4794
+Dual PP metrics: 2397
+
+Dual-card PP summary
+  steps              : 2392 (step 2375..4766)
+  tokens range       : 1..2048
+  makespan avg/p50/p95:  723.291 ms /  456.956 ms / 2129.442 ms
+  bubble ratio avg/p50/p95:   35.70% /   37.86% /   54.02%
+  compute overlap avg/max:   54.20% /   75.70%
+  compute util avg rank0/rank1:   64.18% /   64.42%
+  active util avg rank0/rank1 :   67.52% /   99.97%
+  compute ms avg rank0/rank1  :  483.888 ms /  484.931 ms
+  queue_len range    : 1..37
+  selected_m counts  : M=1: 99, M=2: 1204, M=4: 1089
+  verdict            : visible compute overlap.
+
+Stage duration averages
+  PP rank 0:
+    worker.model_runner_execute      avg= 521.934 ms p95=1636.504 ms n=2397
+    runner.forward.microbatch.0      avg= 187.852 ms p95= 612.778 ms n=2397
+    runner.forward.microbatch.3      avg= 171.103 ms p95= 355.920 ms n=1036
+    runner.forward.microbatch.1      avg= 166.845 ms p95= 562.013 ms n=2159
+    runner.forward.microbatch.2      avg= 162.505 ms p95= 341.263 ms n=1060
+    runner.send.microbatch.1         avg=  30.264 ms p95= 186.271 ms n=2159
+    runner.send.microbatch.2         avg=   5.087 ms p95=   5.001 ms n=1060
+    runner.send.microbatch.3         avg=   3.289 ms p95=   4.046 ms n=1036
+    runner.prepare_input             avg=   2.968 ms p95=   5.477 ms n=2397
+    runner.send.microbatch.0         avg=   2.723 ms p95=   4.747 ms n=2397
+  PP rank 1:
+    worker.model_runner_execute      avg= 700.839 ms p95=2109.125 ms n=2397
+    runner.recv.microbatch.0         avg= 191.766 ms p95= 618.145 ms n=2397
+    runner.forward.microbatch.0      avg= 188.394 ms p95= 618.965 ms n=2397
+    runner.forward.microbatch.3      avg= 171.471 ms p95= 356.221 ms n=1036
+    runner.forward.microbatch.1      avg= 167.087 ms p95= 561.612 ms n=2159
+    runner.forward.microbatch.2      avg= 162.781 ms p95= 341.169 ms n=1060
+    worker.sample_tokens             avg=  22.961 ms p95=  54.078 ms n=2397
+    runner.sample                    avg=  22.372 ms p95=  53.061 ms n=2397
+    runner.recv.microbatch.3         avg=  10.370 ms p95=  22.104 ms n=1036
+    runner.post_process              avg=   8.981 ms p95=   9.088 ms n=2397
+

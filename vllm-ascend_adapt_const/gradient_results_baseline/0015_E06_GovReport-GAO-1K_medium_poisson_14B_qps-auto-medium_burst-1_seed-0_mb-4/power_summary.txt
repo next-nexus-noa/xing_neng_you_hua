@@ -1,0 +1,7 @@
+avg_power_w: 130.9174209787784
+max_power_w: 163.0
+energy_j: 74913.86016464233
+energy_per_request_j: 374.5693008232117
+energy_per_output_token_j: 2.9263226626813412
+tokens_per_joule: 0.3417258160737875
+output_tokens_per_second_per_watt: 0.34750206152191104

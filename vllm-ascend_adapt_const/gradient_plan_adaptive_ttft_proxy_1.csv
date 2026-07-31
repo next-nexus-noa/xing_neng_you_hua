@@ -1,0 +1,2 @@
+run_id,scenario_id,dataset,scenario,model_label,model,request_rate,burstiness,seed,num_prompts,micro_batch,max_model_len,host,port,pp_size,tp_size,dtype,dataset_name,dataset_path,dataset_extra_args
+0001_E04_GovReport-GAO-1K_medium_poisson_3B_qps-auto-medium_burst-1_seed-0_mb-adaptive,E04,GovReport-GAO-1K,medium_poisson,3B,Qwen/Qwen2.5-3B,auto-medium,1,0,200,adaptive,6144,127.0.0.1,8000,2,1,float16,custom,/workspace/DATASET/vllm_custom/gov_report_gao_1K.jsonl,--custom-output-len 128 --skip-chat-template

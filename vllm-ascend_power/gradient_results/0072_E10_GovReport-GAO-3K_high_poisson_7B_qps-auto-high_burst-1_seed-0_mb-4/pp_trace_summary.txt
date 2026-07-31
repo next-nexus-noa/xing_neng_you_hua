@@ -1,0 +1,39 @@
+Trace file: /workspace/vllm_ascend_pp_trace.jsonl
+Rank timelines: 1512
+Dual PP metrics: 756
+
+Dual-card PP summary
+  steps              : 751 (step 749..1499)
+  tokens range       : 1..2048
+  makespan avg/p50/p95:  928.926 ms /  873.402 ms / 1826.879 ms
+  bubble ratio avg/p50/p95:   38.27% /   38.82% /   49.37%
+  compute overlap avg/max:   62.93% /   75.73%
+  compute util avg rank0/rank1:   62.05% /   61.41%
+  active util avg rank0/rank1 :   71.82% /   99.97%
+  compute ms avg rank0/rank1  :  573.647 ms /  568.249 ms
+  verdict            : visible compute overlap.
+
+Stage duration averages
+  PP rank 0:
+    worker.model_runner_execute      avg= 701.793 ms p95=1489.713 ms n=756
+    runner.forward.microbatch.0      avg= 225.238 ms p95= 548.274 ms n=756
+    runner.forward.microbatch.3      avg= 125.910 ms p95= 191.475 ms n=690
+    runner.forward.microbatch.2      avg= 121.852 ms p95= 189.126 ms n=716
+    runner.forward.microbatch.1      avg= 119.028 ms p95= 186.914 ms n=737
+    runner.send.microbatch.1         avg= 112.158 ms p95= 370.865 ms n=737
+    runner.prepare_input             avg=   6.852 ms p95=  12.120 ms n=756
+    runner.send.microbatch.3         avg=   5.053 ms p95=  32.866 ms n=690
+    runner.send.microbatch.2         avg=   4.919 ms p95=  34.868 ms n=716
+    runner.send.microbatch.0         avg=   2.936 ms p95=   3.727 ms n=756
+  PP rank 1:
+    worker.model_runner_execute      avg= 828.102 ms p95=1648.433 ms n=756
+    runner.recv.microbatch.0         avg= 229.540 ms p95= 551.425 ms n=756
+    runner.forward.microbatch.0      avg= 224.276 ms p95= 547.419 ms n=756
+    runner.forward.microbatch.3      avg= 124.223 ms p95= 189.096 ms n=690
+    runner.forward.microbatch.2      avg= 120.238 ms p95= 186.550 ms n=716
+    runner.forward.microbatch.1      avg= 117.648 ms p95= 186.341 ms n=737
+    worker.sample_tokens             avg=  96.992 ms p95= 196.309 ms n=756
+    runner.sample                    avg=  95.647 ms p95= 193.913 ms n=756
+    runner.recv.microbatch.3         avg=   8.298 ms p95=  14.246 ms n=690
+    runner.recv.microbatch.2         avg=   7.319 ms p95=  14.087 ms n=716
+

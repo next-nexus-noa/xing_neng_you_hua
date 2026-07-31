@@ -1,0 +1,1458 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import time
+from dataclasses import dataclass
+from threading import RLock
+from typing import Any
+
+import numpy as np
+import regex as re
+
+
+@dataclass(frozen=True)
+class AdaptiveUBatchFeatures:
+    total_tokens: int
+    num_reqs: int
+    max_query_len: int
+    decode_tokens: int
+    prefill_tokens: int
+    prefill_ratio: float
+    avg_tokens_per_req: float
+    model_billions: float
+    hidden_size: int
+    bucket_key: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WorkloadBucket:
+    model_bucket: str
+    phase_bucket: str
+    token_bucket: str
+
+    def as_tuple(self) -> tuple[str, str, str]:
+        return (self.model_bucket, self.phase_bucket, self.token_bucket)
+
+    @classmethod
+    def from_key(cls, key: tuple[str, ...] | None) -> "WorkloadBucket":
+        if key is None:
+            return cls("unknown", "unknown", "unknown")
+        if len(key) >= 3:
+            return cls(str(key[0]), str(key[1]), str(key[2]))
+        padded = tuple(key) + ("unknown",) * (3 - len(key))
+        return cls(str(padded[0]), str(padded[1]), str(padded[2]))
+
+
+@dataclass
+class CalibrationState:
+    count: int = 0
+    ewma_error_ms: float = 0.0
+    ewma_abs_error_ms: float = 0.0
+    ewma_squared_error: float = 0.0
+    ewma_log_ratio: float = 0.0
+    ewma_squared_log_ratio: float = 0.0
+    last_actual_ms: float | None = None
+    last_predicted_ms: float | None = None
+    last_prior_ms: float | None = None
+    last_update_step: int = -1
+
+    def update(
+        self,
+        *,
+        error_ms: float,
+        predicted_ms: float,
+        prior_ms: float,
+        actual_ms: float,
+        step_id: int,
+        alpha: float,
+    ) -> None:
+        log_ratio = math.log(max(actual_ms, 1e-9) / max(prior_ms, 1e-9))
+        if self.count == 0:
+            self.ewma_error_ms = error_ms
+            self.ewma_abs_error_ms = abs(error_ms)
+            self.ewma_squared_error = error_ms * error_ms
+            self.ewma_log_ratio = log_ratio
+            self.ewma_squared_log_ratio = log_ratio * log_ratio
+        else:
+            self.ewma_error_ms = (
+                alpha * error_ms + (1.0 - alpha) * self.ewma_error_ms
+            )
+            self.ewma_abs_error_ms = (
+                alpha * abs(error_ms)
+                + (1.0 - alpha) * self.ewma_abs_error_ms
+            )
+            self.ewma_squared_error = (
+                alpha * error_ms * error_ms
+                + (1.0 - alpha) * self.ewma_squared_error
+            )
+            self.ewma_log_ratio = (
+                alpha * log_ratio + (1.0 - alpha) * self.ewma_log_ratio
+            )
+            self.ewma_squared_log_ratio = (
+                alpha * log_ratio * log_ratio
+                + (1.0 - alpha) * self.ewma_squared_log_ratio
+            )
+        self.count += 1
+        self.last_actual_ms = actual_ms
+        self.last_predicted_ms = predicted_ms
+        self.last_prior_ms = prior_ms
+        self.last_update_step = step_id
+
+
+@dataclass
+class BucketDecisionState:
+    current_m: int
+    last_change_step: int = -(10**9)
+    pending_m: int | None = None
+    pending_wins: int = 0
+    bad_streak: int = 0
+
+
+@dataclass(frozen=True)
+class CandidateScore:
+    m: int
+    prior_cost_ms: float
+    correction_ms: float
+    calibrated_cost_ms: float
+    uncertainty_ms: float
+    robust_cost_ms: float
+    count: int
+    rejected: bool = False
+    rejection_reason: str | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        calibration_scale = (
+            self.calibrated_cost_ms / self.prior_cost_ms
+            if self.prior_cost_ms > 0
+            else None
+        )
+        return {
+            "m": self.m,
+            "prior_ms": self.prior_cost_ms,
+            "correction_ms": self.correction_ms,
+            "calibration_scale": calibration_scale,
+            "calibrated_ms": self.calibrated_cost_ms,
+            "uncertainty_ms": self.uncertainty_ms,
+            "robust_ms": self.robust_cost_ms,
+            "count": self.count,
+            "rejected": self.rejected,
+            "rejection_reason": self.rejection_reason,
+        }
+
+
+@dataclass(frozen=True)
+class AdaptiveUBatchDecision:
+    num_ubatches: int
+    predicted_gain_pct: float
+    reason: str
+    bucket_key: tuple[str, ...] | None = None
+    total_tokens: int = 0
+    online: bool = False
+    num_reqs: int = 0
+    predicted_cost_ms: float | None = None
+    robust_cost_ms: float | None = None
+    previous_m: int | None = None
+    switched: bool = False
+    fallback: bool = False
+    decision_overhead_us: float | None = None
+    candidate_scores: tuple[dict[str, Any], ...] = ()
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "num_ubatches": self.num_ubatches,
+            "predicted_gain_pct": self.predicted_gain_pct,
+            "reason": self.reason,
+            "bucket_key": self.bucket_key,
+            "total_tokens": self.total_tokens,
+            "online": self.online,
+            "num_reqs": self.num_reqs,
+            "predicted_cost_ms": self.predicted_cost_ms,
+            "robust_cost_ms": self.robust_cost_ms,
+            "previous_m": self.previous_m,
+            "switched": self.switched,
+            "fallback": self.fallback,
+            "decision_overhead_us": self.decision_overhead_us,
+            "candidate_scores": list(self.candidate_scores),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "AdaptiveUBatchDecision":
+        bucket_key = payload.get("bucket_key")
+        if bucket_key is not None:
+            bucket_key = tuple(bucket_key)
+        return cls(
+            num_ubatches=int(payload["num_ubatches"]),
+            predicted_gain_pct=float(payload["predicted_gain_pct"]),
+            reason=str(payload["reason"]),
+            bucket_key=bucket_key,
+            total_tokens=int(payload.get("total_tokens", 0)),
+            online=bool(payload.get("online", False)),
+            num_reqs=int(payload.get("num_reqs", 0)),
+            predicted_cost_ms=_optional_float(payload.get("predicted_cost_ms")),
+            robust_cost_ms=_optional_float(payload.get("robust_cost_ms")),
+            previous_m=_optional_int(payload.get("previous_m")),
+            switched=bool(payload.get("switched", False)),
+            fallback=bool(payload.get("fallback", False)),
+            decision_overhead_us=_optional_float(
+                payload.get("decision_overhead_us")
+            ),
+            candidate_scores=tuple(payload.get("candidate_scores", ())),
+        )
+
+
+@dataclass(frozen=True)
+class ExecutionObservation:
+    selected_m: int
+    bucket: WorkloadBucket
+    predicted_cost_ms: float
+    actual_step_ms: float
+    success: bool = True
+    failure_reason: str | None = None
+
+
+def _optional_float(value: Any) -> float | None:
+    return None if value is None else float(value)
+
+
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
+def _is_finite_positive(value: float | None) -> bool:
+    return value is not None and math.isfinite(value) and value > 0.0
+
+
+def _with_feature_counts(
+    decision: AdaptiveUBatchDecision,
+    features: AdaptiveUBatchFeatures,
+) -> AdaptiveUBatchDecision:
+    if (
+        decision.total_tokens == features.total_tokens
+        and decision.num_reqs == features.num_reqs
+    ):
+        return decision
+    return AdaptiveUBatchDecision(
+        num_ubatches=decision.num_ubatches,
+        predicted_gain_pct=decision.predicted_gain_pct,
+        reason=decision.reason,
+        bucket_key=decision.bucket_key,
+        total_tokens=features.total_tokens,
+        online=decision.online,
+        num_reqs=features.num_reqs,
+        predicted_cost_ms=decision.predicted_cost_ms,
+        robust_cost_ms=decision.robust_cost_ms,
+        previous_m=decision.previous_m,
+        switched=decision.switched,
+        fallback=decision.fallback,
+        decision_overhead_us=decision.decision_overhead_us,
+        candidate_scores=decision.candidate_scores,
+    )
+
+
+def _extract_model_billions(model_config: Any) -> float | None:
+    """Best-effort model-size extraction for local scheduling policy."""
+    names = [
+        getattr(model_config, "model", None),
+        getattr(model_config, "served_model_name", None),
+    ]
+    hf_config = getattr(model_config, "hf_config", None)
+    if hf_config is not None:
+        names.extend(
+            [
+                getattr(hf_config, "_name_or_path", None),
+                getattr(hf_config, "model_type", None),
+            ]
+        )
+    for name in names:
+        if not name:
+            continue
+        match = re.search(r"(\d+(?:\.\d+)?)\s*b", str(name), flags=re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+
+    if hf_config is None:
+        return None
+    hidden_size = int(getattr(hf_config, "hidden_size", 0) or 0)
+    num_layers = int(getattr(hf_config, "num_hidden_layers", 0) or 0)
+    if hidden_size >= 5000 or num_layers >= 48:
+        return 14.0
+    if hidden_size >= 3500:
+        return 7.0
+    if hidden_size > 0:
+        return 3.0
+    return None
+
+
+def _extract_hidden_size(model_config: Any) -> int:
+    hf_config = getattr(model_config, "hf_config", None)
+    if hf_config is None:
+        return 0
+    hidden_size = int(getattr(hf_config, "hidden_size", 0) or 0)
+    if hidden_size > 0:
+        return hidden_size
+    text_config = getattr(hf_config, "text_config", None)
+    return int(getattr(text_config, "hidden_size", 0) or 0) if text_config else 0
+
+
+def _cap_candidate(candidate: int, max_ubatches: int, total_tokens: int) -> int:
+    return max(1, min(candidate, max(1, max_ubatches), max(1, total_tokens)))
+
+
+def _scheduled_token_features(
+    num_scheduled_tokens: np.ndarray | list[int],
+) -> tuple[int, int, int, int, int, float, float]:
+    tokens = np.asarray(num_scheduled_tokens, dtype=np.int64)
+    if tokens.size == 0:
+        return 0, 0, 0, 0, 0, 0.0, 0.0
+    total = int(tokens.sum())
+    max_query = int(tokens.max())
+    num_reqs = int(tokens.size)
+    prefill_tokens = int(np.maximum(tokens - 1, 0).sum())
+    decode_tokens = max(0, total - prefill_tokens)
+    prefill_ratio = prefill_tokens / total if total > 0 else 0.0
+    avg_tokens_per_req = total / num_reqs if num_reqs > 0 else 0.0
+    return (
+        total,
+        num_reqs,
+        max_query,
+        decode_tokens,
+        prefill_tokens,
+        prefill_ratio,
+        avg_tokens_per_req,
+    )
+
+
+def _bucketize_features(
+    *,
+    model_b: float,
+    total: int,
+    max_query: int,
+    prefill_ratio: float,
+) -> tuple[str, str, str]:
+    if model_b > 7.0:
+        model_bucket = "large"
+    elif model_b >= 3.0:
+        model_bucket = "medium"
+    else:
+        model_bucket = "small"
+
+    if prefill_ratio >= 0.70:
+        phase_bucket = "prefill"
+    elif prefill_ratio >= 0.10:
+        phase_bucket = "mixed"
+    else:
+        phase_bucket = "decode"
+
+    if total < 256:
+        token_bucket = "small"
+    elif total < 1024:
+        token_bucket = "medium"
+    else:
+        token_bucket = "large"
+    return model_bucket, phase_bucket, token_bucket
+
+
+def _prefill_threshold_from_config(parallel_config: Any) -> float:
+    threshold = getattr(
+        parallel_config,
+        "adaptive_ubatch_prefill_threshold_pct",
+        0.0,
+    )
+    if threshold is None:
+        threshold = 0.0
+    return max(0.0, min(100.0, float(threshold))) / 100.0
+
+
+def extract_adaptive_ubatch_features(
+    *,
+    model_config: Any,
+    num_scheduled_tokens: np.ndarray | list[int],
+) -> AdaptiveUBatchFeatures:
+    (
+        total,
+        num_reqs,
+        max_query,
+        decode_tokens,
+        prefill_tokens,
+        prefill_ratio,
+        avg_tokens,
+    ) = (
+        _scheduled_token_features(num_scheduled_tokens)
+    )
+    model_b = _extract_model_billions(model_config)
+    model_b = model_b if model_b is not None else 7.0
+    hidden_size = _extract_hidden_size(model_config)
+    if hidden_size <= 0:
+        if model_b >= 13.0:
+            hidden_size = 5120
+        elif model_b >= 6.0:
+            hidden_size = 3584
+        else:
+            hidden_size = 2048
+    return AdaptiveUBatchFeatures(
+        total_tokens=total,
+        num_reqs=num_reqs,
+        max_query_len=max_query,
+        decode_tokens=decode_tokens,
+        prefill_tokens=prefill_tokens,
+        prefill_ratio=prefill_ratio,
+        avg_tokens_per_req=avg_tokens,
+        model_billions=model_b,
+        hidden_size=hidden_size,
+        bucket_key=_bucketize_features(
+            model_b=model_b,
+            total=total,
+            max_query=max_query,
+            prefill_ratio=prefill_ratio,
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class _AnalyticalParams:
+    alpha: float
+    beta: float
+    gamma: float
+    delta: float = 1.5
+    epsilon: float = 1.2e-6
+    sigma: float = 0.38
+
+
+def _analytical_params_for_model(model_b: float) -> _AnalyticalParams:
+    # Defaults are the fitted 310P PP=2 parameters summarized in the v2 plan.
+    # They are used directly by the adaptive selector.
+    if model_b >= 13.0:
+        return _AnalyticalParams(
+            alpha=0.73,
+            beta=98.0,
+            gamma=25.0,
+            sigma=0.28,
+        )
+    if model_b >= 6.0:
+        return _AnalyticalParams(
+            alpha=0.52,
+            beta=135.0,
+            gamma=38.0,
+            sigma=0.38,
+        )
+    return _AnalyticalParams(
+        alpha=0.29,
+        beta=124.0,
+        gamma=42.0,
+        sigma=0.52,
+    )
+
+
+def _effective_overlap(m: int, features: AdaptiveUBatchFeatures) -> float:
+    if m <= 1:
+        return 1.0
+    if m == 2:
+        base = 1.48
+    elif m == 4:
+        base = 1.78
+    else:
+        base = 1.0 + min(0.8, 0.28 * (m - 1))
+
+    # Low-prefill batches do not have enough pipeline bubble to hide the split
+    # overhead. This encodes the v2 prefill-threshold observation smoothly.
+    if features.prefill_ratio < 0.80:
+        base = min(base, 1.08)
+    elif features.prefill_ratio < 0.90:
+        base = min(base, 1.25 if m == 2 else 1.18)
+
+    # Large-model M=4 overlap looks attractive in traces but often loses after
+    # split/KV pressure; keep its analytical prior conservative.
+    if features.model_billions >= 13.0 and m >= 4:
+        base = min(base, 1.20)
+    return max(1.0, min(float(m), base))
+
+
+def _analytical_cost_ms(
+    m: int,
+    features: AdaptiveUBatchFeatures,
+) -> float:
+    params = _analytical_params_for_model(features.model_billions)
+    total_tokens = max(1.0, float(features.total_tokens))
+    decode_tokens = max(0.0, float(features.decode_tokens))
+    m_float = max(1.0, float(m))
+    compute = (
+        params.alpha
+        * total_tokens
+        * (1.0 + (m_float * params.beta) /
+           (total_tokens + m_float * params.gamma))
+    )
+    comm = m_float * params.delta + params.epsilon * total_tokens * features.hidden_size
+    sample = params.sigma * decode_tokens
+    step_ms = compute + comm + sample
+    return step_ms / _effective_overlap(m, features)
+
+
+def _candidate_ms(
+    *,
+    parallel_config: Any,
+    features: AdaptiveUBatchFeatures,
+) -> list[int]:
+    max_ubatches = int(getattr(parallel_config, "adaptive_ubatch_max_size", 4) or 1)
+    prefill_threshold = _prefill_threshold_from_config(parallel_config)
+    min_tokens_m2 = int(
+        getattr(parallel_config, "adaptive_ubatch_min_tokens_m2", 128) or 128
+    )
+    min_tokens_m4 = int(
+        getattr(parallel_config, "adaptive_ubatch_min_tokens_m4", 512) or 512
+    )
+    min_prefill_m4 = float(
+        getattr(parallel_config, "adaptive_ubatch_min_prefill_ratio_m4", 0.85)
+    )
+    candidates = [1]
+    if features.prefill_ratio < prefill_threshold:
+        return candidates
+    if max_ubatches >= 2 and features.total_tokens >= min_tokens_m2:
+        candidates.append(2)
+    disable_m4_large = bool(
+        getattr(parallel_config, "adaptive_ubatch_disable_m4_for_large_model", False)
+    )
+    allow_m4_large = not disable_m4_large or features.model_billions < 13.0
+    if (
+        max_ubatches >= 4
+        and features.total_tokens >= min_tokens_m4
+        and features.prefill_ratio >= min_prefill_m4
+        and allow_m4_large
+    ):
+        candidates.append(4)
+    return candidates
+
+
+def _select_analytical_prior(
+    *,
+    parallel_config: Any,
+    features: AdaptiveUBatchFeatures,
+) -> AdaptiveUBatchDecision:
+    min_gain = float(getattr(parallel_config, "adaptive_ubatch_min_gain_pct", 5.0))
+    prefill_threshold = _prefill_threshold_from_config(parallel_config)
+
+    if features.prefill_ratio < prefill_threshold:
+        return AdaptiveUBatchDecision(
+            1,
+            0.0,
+            (
+                "analytical_prefill_below_threshold;"
+                f"prefill={features.prefill_ratio:.3f}"
+            ),
+            features.bucket_key,
+            features.total_tokens,
+            predicted_cost_ms=_analytical_cost_ms(1, features),
+            robust_cost_ms=_analytical_cost_ms(1, features),
+        )
+
+    candidates = _candidate_ms(parallel_config=parallel_config, features=features)
+
+    if not candidates:
+        candidates = [1]
+
+    costs = {m: _analytical_cost_ms(m, features) for m in candidates}
+    baseline = costs[1]
+    best_m = min(costs, key=costs.get)
+    predicted_gain = (
+        (baseline - costs[best_m]) / max(baseline, 1e-9) * 100.0
+    )
+
+    if best_m <= 1 or predicted_gain < min_gain:
+        return AdaptiveUBatchDecision(
+            1,
+            max(0.0, predicted_gain),
+            (
+                "analytical_gain_below_threshold;"
+                f"best_m={best_m}; gain={predicted_gain:.2f}%"
+            ),
+            features.bucket_key,
+            features.total_tokens,
+            predicted_cost_ms=costs[1],
+            robust_cost_ms=costs[1],
+        )
+    return AdaptiveUBatchDecision(
+        _cap_candidate(
+            best_m,
+            int(getattr(parallel_config, "adaptive_ubatch_max_size", 4) or 1),
+            features.total_tokens,
+        ),
+        predicted_gain,
+        (
+            "analytical_model_prior;"
+            f"costs={','.join(f'M{m}:{costs[m]:.2f}' for m in sorted(costs))}"
+        ),
+        features.bucket_key,
+        features.total_tokens,
+        predicted_cost_ms=costs[best_m],
+        robust_cost_ms=costs[best_m],
+    )
+
+
+def select_adaptive_ubatch_count(
+    *,
+    parallel_config: Any,
+    model_config: Any,
+    num_scheduled_tokens: np.ndarray | list[int],
+) -> AdaptiveUBatchDecision:
+    """Offline-prior selector used for cold start and compatibility."""
+
+    max_ubatches = int(getattr(parallel_config, "adaptive_ubatch_max_size", 4) or 1)
+    min_gain = float(getattr(parallel_config, "adaptive_ubatch_min_gain_pct", 5.0))
+    features = extract_adaptive_ubatch_features(
+        model_config=model_config,
+        num_scheduled_tokens=num_scheduled_tokens,
+    )
+    if features.total_tokens <= 1 or features.num_reqs <= 1:
+        return AdaptiveUBatchDecision(
+            1,
+            0.0,
+            "too_few_tokens_or_requests",
+            features.bucket_key,
+            features.total_tokens,
+        )
+
+    if bool(getattr(parallel_config, "adaptive_ubatch_use_analytical_prior", True)):
+        return _select_analytical_prior(
+            parallel_config=parallel_config,
+            features=features,
+        )
+
+    candidate = 1
+    predicted_gain = 0.0
+    reason = "predicted_gain_below_threshold"
+
+    if features.model_billions >= 13.0:
+        if (
+            features.prefill_ratio >= 0.95
+            and features.total_tokens >= 384
+            and max_ubatches >= 2
+        ):
+            candidate = 2
+            predicted_gain = 2.0
+            reason = "14b_extreme_prefill_guarded_m2"
+        else:
+            reason = "14b_split_overhead_guard"
+    elif features.model_billions >= 6.0:
+        if (
+            features.prefill_ratio >= 0.90
+            and features.max_query_len >= 512
+            and features.total_tokens >= 256
+        ):
+            candidate = 4
+            predicted_gain = 18.0
+            reason = "7b_long_prefill_m4"
+        elif features.prefill_ratio >= 0.65 and features.total_tokens >= 128:
+            candidate = 2
+            predicted_gain = 10.0
+            reason = "7b_prefill_heavy_m2"
+        elif features.total_tokens >= 128:
+            candidate = 2
+            predicted_gain = 6.0
+            reason = "7b_large_batch_m2"
+    else:
+        if features.total_tokens >= 64:
+            candidate = 2
+            predicted_gain = 7.0
+            reason = "3b_general_m2"
+
+    if predicted_gain < min_gain:
+        return AdaptiveUBatchDecision(
+            1,
+            predicted_gain,
+            reason,
+            features.bucket_key,
+            features.total_tokens,
+        )
+    candidate = _cap_candidate(candidate, max_ubatches, features.total_tokens)
+    if candidate <= 1:
+        return AdaptiveUBatchDecision(
+            1,
+            predicted_gain,
+            "candidate_capped_to_one",
+            features.bucket_key,
+            features.total_tokens,
+        )
+    return AdaptiveUBatchDecision(
+        candidate,
+        predicted_gain,
+        reason,
+        features.bucket_key,
+        features.total_tokens,
+    )
+
+
+class AdaptiveUBatchController:
+    """Trace-calibrated risk-aware micro-batch degree controller.
+
+    The analytical cost model remains the cold-start prior. Runtime
+    observations update per-(bucket, M) EWMA prediction error and residual
+    variance, allowing later decisions to use calibrated and risk-penalized
+    costs while preserving an analytical-only mode for ablations.
+    """
+
+    def __init__(self, *, parallel_config: Any, model_config: Any) -> None:
+        self.parallel_config = parallel_config
+        self.model_config = model_config
+        self._lock = RLock()
+        self._step_id = 0
+        self._current_m = max(1, int(getattr(parallel_config, "adaptive_ubatch_safe_m", 1)))
+        self._last_change_step = -10**9
+        self._last_explore_step = -10**9
+        self._last_bucket: WorkloadBucket | None = None
+        self._stable_bucket_steps = 0
+        self._bucket_decisions: dict[
+            tuple[str, str, str], BucketDecisionState
+        ] = {}
+        self._calibration: dict[tuple[tuple[str, str, str], int], CalibrationState] = {}
+        self._cooldown_until: dict[tuple[tuple[str, str, str], int], int] = {}
+        self._trace_path = getattr(
+            parallel_config, "adaptive_ubatch_trace_path", None
+        ) or os.getenv("VLLM_ADAPTIVE_UBATCH_TRACE_PATH")
+
+    def _mode(self) -> str:
+        return str(
+            getattr(
+                self.parallel_config,
+                "adaptive_ubatch_mode",
+                "calibrated_risk_aware",
+            )
+        )
+
+    def _min_observations(self) -> int:
+        explicit = getattr(
+            self.parallel_config,
+            "adaptive_ubatch_min_observations",
+            None,
+        )
+        if explicit is not None:
+            return max(1, int(explicit))
+        return max(
+            1,
+            int(getattr(self.parallel_config, "adaptive_ubatch_warmup_steps", 8) or 8),
+        )
+
+    def _alpha(self) -> float:
+        return max(
+            1e-6,
+            min(1.0, float(getattr(self.parallel_config, "adaptive_ubatch_ewma_alpha", 0.2))),
+        )
+
+    def _state(self, bucket: WorkloadBucket, m: int) -> CalibrationState:
+        key = (bucket.as_tuple(), m)
+        state = self._calibration.get(key)
+        if state is None:
+            state = CalibrationState()
+            self._calibration[key] = state
+        return state
+
+    def _decision_state(self, bucket: WorkloadBucket) -> BucketDecisionState:
+        key = bucket.as_tuple()
+        state = self._bucket_decisions.get(key)
+        if state is None:
+            state = BucketDecisionState(
+                current_m=max(
+                    1,
+                    int(
+                        getattr(
+                            self.parallel_config,
+                            "adaptive_ubatch_safe_m",
+                            1,
+                        )
+                    ),
+                )
+            )
+            self._bucket_decisions[key] = state
+        return state
+
+    def _lookup_state(self, bucket: WorkloadBucket, m: int) -> CalibrationState:
+        exact = self._calibration.get((bucket.as_tuple(), m))
+        if exact is not None and exact.count > 0:
+            return exact
+        return CalibrationState()
+
+    def _calibration_scale(self, state: CalibrationState) -> float:
+        if state.count <= 0:
+            return 1.0
+        max_scale = max(
+            1.0,
+            float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_max_calibration_scale",
+                    8.0,
+                )
+            ),
+        )
+        scale = math.exp(
+            max(-math.log(max_scale), min(math.log(max_scale), state.ewma_log_ratio))
+        )
+        return max(1.0 / max_scale, min(max_scale, scale))
+
+    def _uncertainty_ms(self, calibrated: float, state: CalibrationState) -> float:
+        log_variance = (
+            state.ewma_squared_log_ratio
+            - state.ewma_log_ratio * state.ewma_log_ratio
+        )
+        log_sigma = math.sqrt(max(log_variance, 0.0))
+        max_scale = max(
+            1.0,
+            float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_max_calibration_scale",
+                    8.0,
+                )
+            ),
+        )
+        uncertainty = calibrated * (
+            math.exp(min(log_sigma, math.log(max_scale))) - 1.0
+        )
+        min_obs = self._min_observations()
+        if state.count < min_obs:
+            penalty_ratio = float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_cold_start_penalty_ratio",
+                    0.15,
+                )
+            )
+            scarcity = 1.0 - state.count / max(1, min_obs)
+            uncertainty += calibrated * penalty_ratio * max(0.0, scarcity)
+        return uncertainty
+
+    def _score_candidates(
+        self,
+        *,
+        features: AdaptiveUBatchFeatures,
+        bucket: WorkloadBucket,
+        candidates: list[int],
+        current_m: int,
+        safe_m: int,
+    ) -> list[CandidateScore]:
+        mode = self._mode()
+        risk_enabled = mode == "calibrated_risk_aware"
+        calibration_enabled = mode in {"calibrated", "calibrated_risk_aware"}
+        risk_kappa = float(
+            getattr(self.parallel_config, "adaptive_ubatch_risk_kappa", 1.0)
+        )
+        max_uncertainty_ratio = float(
+            getattr(
+                self.parallel_config,
+                "adaptive_ubatch_max_uncertainty_ratio",
+                0.15,
+            )
+        )
+        scores: list[CandidateScore] = []
+        for m in candidates:
+            prior = _analytical_cost_ms(m, features)
+            if not math.isfinite(prior) or prior <= 0:
+                scores.append(CandidateScore(
+                    m=m,
+                    prior_cost_ms=prior,
+                    correction_ms=0.0,
+                    calibrated_cost_ms=max(prior, 1e-6),
+                    uncertainty_ms=float("inf"),
+                    robust_cost_ms=float("inf"),
+                    count=0,
+                    rejected=True,
+                    rejection_reason="invalid_prior_cost",
+                ))
+                continue
+            state = self._lookup_state(bucket, m)
+            scale = self._calibration_scale(state) if calibration_enabled else 1.0
+            calibrated = max(1e-6, prior * scale)
+            correction = calibrated - prior
+            uncertainty = (
+                self._uncertainty_ms(calibrated, state)
+                if calibration_enabled
+                else 0.0
+            )
+            robust = calibrated + (risk_kappa * uncertainty if risk_enabled else 0.0)
+            rejected = False
+            rejection_reason = None
+            if risk_enabled:
+                cooldown_key = (bucket.as_tuple(), m)
+                if (
+                    m != safe_m
+                    and self._cooldown_until.get(cooldown_key, -1) > self._step_id
+                ):
+                    rejected = True
+                    rejection_reason = "cooldown"
+                elif (
+                    state.count >= self._min_observations()
+                    and uncertainty / max(calibrated, 1e-6) > max_uncertainty_ratio
+                    and m not in {current_m, safe_m}
+                ):
+                    rejected = True
+                    rejection_reason = "uncertainty_too_high"
+            scores.append(CandidateScore(
+                m=m,
+                prior_cost_ms=prior,
+                correction_ms=correction,
+                calibrated_cost_ms=calibrated,
+                uncertainty_ms=uncertainty,
+                robust_cost_ms=robust,
+                count=state.count,
+                rejected=rejected,
+                rejection_reason=rejection_reason,
+            ))
+        return scores
+
+    def _select_exploration(
+        self,
+        *,
+        scores: list[CandidateScore],
+        current_score: CandidateScore,
+        bad_streak: int,
+    ) -> CandidateScore | None:
+        if self._mode() != "calibrated_risk_aware":
+            return None
+        if not bool(
+            getattr(
+                self.parallel_config,
+                "adaptive_ubatch_enable_exploration",
+                float(
+                    getattr(
+                        self.parallel_config,
+                        "adaptive_ubatch_explore_pct",
+                        0.0,
+                    )
+                ) > 0,
+            )
+        ):
+            return None
+        interval = int(
+            getattr(
+                self.parallel_config,
+                "adaptive_ubatch_exploration_interval_steps",
+                64,
+            )
+            or 64
+        )
+        stable_steps = int(
+            getattr(
+                self.parallel_config,
+                "adaptive_ubatch_exploration_stable_steps",
+                8,
+            )
+            or 8
+        )
+        if self._step_id - self._last_explore_step < interval:
+            return None
+        if self._stable_bucket_steps < stable_steps or bad_streak > 0:
+            return None
+        current_m = current_score.m
+        adjacent = [
+            s for s in scores
+            if not s.rejected and s.m != current_m and abs(s.m - current_m) <= 2
+        ]
+        if not adjacent:
+            return None
+        max_regret = float(
+            getattr(
+                self.parallel_config,
+                "adaptive_ubatch_max_exploration_regret_pct",
+                5.0,
+            )
+        )
+        safe = [
+            s for s in adjacent
+            if (
+                (s.robust_cost_ms - current_score.robust_cost_ms)
+                / max(current_score.robust_cost_ms, 1e-6)
+                * 100.0
+            ) <= max_regret
+        ]
+        if not safe:
+            return None
+        return min(safe, key=lambda s: (s.count, s.robust_cost_ms))
+
+    def _write_trace(self, record: dict[str, Any]) -> None:
+        if not self._trace_path:
+            return
+        directory = os.path.dirname(self._trace_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(self._trace_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def commit_effective_m(
+        self,
+        decision: AdaptiveUBatchDecision,
+        *,
+        effective_m: int,
+        reason: str,
+        fallback: bool | None = None,
+    ) -> AdaptiveUBatchDecision:
+        """Synchronize controller state with the M that will actually execute."""
+        with self._lock:
+            effective_m = max(1, int(effective_m))
+            bucket = WorkloadBucket.from_key(decision.bucket_key)
+            bucket_state = self._decision_state(bucket)
+            previous_m = (
+                decision.previous_m
+                if decision.previous_m is not None
+                else bucket_state.current_m
+            )
+            switched = effective_m != previous_m
+            self._current_m = effective_m
+            bucket_state.current_m = effective_m
+            bucket_state.pending_m = None
+            bucket_state.pending_wins = 0
+            if switched:
+                self._last_change_step = self._step_id
+                bucket_state.last_change_step = self._step_id
+            return AdaptiveUBatchDecision(
+                num_ubatches=effective_m,
+                predicted_gain_pct=decision.predicted_gain_pct,
+                reason=f"{decision.reason}; {reason}",
+                bucket_key=decision.bucket_key,
+                total_tokens=decision.total_tokens,
+                online=decision.online,
+                num_reqs=decision.num_reqs,
+                predicted_cost_ms=decision.predicted_cost_ms,
+                robust_cost_ms=decision.robust_cost_ms,
+                previous_m=previous_m,
+                switched=switched,
+                fallback=decision.fallback if fallback is None else fallback,
+                decision_overhead_us=decision.decision_overhead_us,
+                candidate_scores=decision.candidate_scores,
+            )
+
+    def observe_rejection(
+        self,
+        decision: AdaptiveUBatchDecision | None,
+        *,
+        reason: str,
+    ) -> None:
+        """Record a candidate rejection before execution without bad streak."""
+        with self._lock:
+            if decision is None:
+                return
+            bucket = WorkloadBucket.from_key(decision.bucket_key)
+            m = max(1, int(decision.num_ubatches))
+            safe_m = max(
+                1,
+                int(getattr(self.parallel_config, "adaptive_ubatch_safe_m", 1)),
+            )
+            affects_cooldown = m != safe_m
+            if affects_cooldown:
+                self._cooldown_until[(bucket.as_tuple(), m)] = (
+                    self._step_id
+                    + int(
+                        getattr(
+                            self.parallel_config,
+                            "adaptive_ubatch_cooldown_steps",
+                            8,
+                        )
+                    )
+                )
+            event_type = (
+                "adaptive_ubatch_unsupported_fallback"
+                if reason.startswith("unsupported:")
+                else "adaptive_ubatch_rejection"
+            )
+            self._write_trace({
+                "type": event_type,
+                "step_id": self._step_id,
+                "bucket": bucket.as_tuple(),
+                "rejected_m": m,
+                "reason": reason,
+                "affects_cooldown": affects_cooldown,
+            })
+
+    def select(
+        self,
+        num_scheduled_tokens: np.ndarray | list[int],
+    ) -> AdaptiveUBatchDecision:
+        start_ns = time.perf_counter_ns()
+        with self._lock:
+            self._step_id += 1
+            features = extract_adaptive_ubatch_features(
+                model_config=self.model_config,
+                num_scheduled_tokens=num_scheduled_tokens,
+            )
+            bucket = WorkloadBucket.from_key(features.bucket_key)
+            if self._last_bucket == bucket:
+                self._stable_bucket_steps += 1
+            else:
+                self._stable_bucket_steps = 1
+                self._last_bucket = bucket
+            bucket_state = self._decision_state(bucket)
+
+            if features.total_tokens <= 1 or features.num_reqs <= 1:
+                prior_ms = _analytical_cost_ms(1, features)
+                calibration = self._lookup_state(bucket, 1)
+                calibrated_ms = prior_ms * self._calibration_scale(calibration)
+                decision = AdaptiveUBatchDecision(
+                    num_ubatches=1,
+                    predicted_gain_pct=0.0,
+                    reason="too_few_tokens_or_requests",
+                    bucket_key=features.bucket_key,
+                    total_tokens=features.total_tokens,
+                    online=self._mode() != "analytical_only",
+                    num_reqs=features.num_reqs,
+                    predicted_cost_ms=calibrated_ms,
+                    robust_cost_ms=calibrated_ms,
+                    previous_m=bucket_state.current_m,
+                    switched=False,
+                    fallback=True,
+                    decision_overhead_us=(
+                        time.perf_counter_ns() - start_ns
+                    )
+                    / 1000.0,
+                    candidate_scores=(
+                        CandidateScore(
+                            m=1,
+                            prior_cost_ms=prior_ms,
+                            correction_ms=calibrated_ms - prior_ms,
+                            calibrated_cost_ms=calibrated_ms,
+                            uncertainty_ms=0.0,
+                            robust_cost_ms=calibrated_ms,
+                            count=calibration.count,
+                        ).to_payload(),
+                    ),
+                )
+                self._write_trace({
+                    "type": "adaptive_ubatch_ineligible",
+                    "step_id": self._step_id,
+                    "bucket": bucket.as_tuple(),
+                    "reason": decision.reason,
+                    "selected_m": 1,
+                    "affects_cooldown": False,
+                    "features": {
+                        "total_tokens": features.total_tokens,
+                        "num_reqs": features.num_reqs,
+                        "prefill_ratio": features.prefill_ratio,
+                        "model_billions": features.model_billions,
+                    },
+                })
+                return decision
+
+            if self._mode() == "analytical_only":
+                decision = _with_feature_counts(select_adaptive_ubatch_count(
+                    parallel_config=self.parallel_config,
+                    model_config=self.model_config,
+                    num_scheduled_tokens=num_scheduled_tokens,
+                ), features)
+                return AdaptiveUBatchDecision(
+                    num_ubatches=decision.num_ubatches,
+                    predicted_gain_pct=decision.predicted_gain_pct,
+                    reason=f"analytical_only; prior={decision.reason}",
+                    bucket_key=decision.bucket_key,
+                    total_tokens=decision.total_tokens,
+                    online=False,
+                    num_reqs=decision.num_reqs,
+                    predicted_cost_ms=decision.predicted_cost_ms,
+                    robust_cost_ms=decision.robust_cost_ms,
+                    previous_m=bucket_state.current_m,
+                    switched=decision.num_ubatches != bucket_state.current_m,
+                    decision_overhead_us=(time.perf_counter_ns() - start_ns) / 1000.0,
+                )
+
+            candidates = _candidate_ms(
+                parallel_config=self.parallel_config,
+                features=features,
+            )
+            if not candidates:
+                candidates = [1]
+            safe_m = max(
+                1,
+                min(
+                    int(getattr(self.parallel_config, "adaptive_ubatch_safe_m", 1)),
+                    max(candidates),
+                ),
+            )
+            previous_m = (
+                bucket_state.current_m
+                if bucket_state.current_m in candidates
+                else safe_m
+            )
+            scores = self._score_candidates(
+                features=features,
+                bucket=bucket,
+                candidates=candidates,
+                current_m=previous_m,
+                safe_m=safe_m,
+            )
+            valid_scores = [s for s in scores if not s.rejected]
+            current_score = next(
+                (s for s in scores if s.m == previous_m and not s.rejected),
+                None,
+            )
+            if current_score is None:
+                current_score = next((s for s in scores if s.m == safe_m), scores[0])
+
+            reason = "robust_cost_improvement"
+            fallback = False
+            if not valid_scores:
+                selected = current_score
+                reason = "all_candidates_rejected"
+                fallback = True
+            else:
+                exploration = self._select_exploration(
+                    scores=valid_scores,
+                    current_score=current_score,
+                    bad_streak=bucket_state.bad_streak,
+                )
+                if exploration is not None:
+                    selected = exploration
+                    reason = "controlled_exploration"
+                    self._last_explore_step = self._step_id
+                else:
+                    best = min(valid_scores, key=lambda s: s.robust_cost_ms)
+                    min_hold = int(
+                        getattr(self.parallel_config, "adaptive_ubatch_min_hold_steps", 4)
+                    )
+                    if best.m == previous_m:
+                        selected = best
+                        reason = "keep_current_best"
+                        bucket_state.pending_m = None
+                        bucket_state.pending_wins = 0
+                    elif self._step_id - bucket_state.last_change_step < min_hold:
+                        selected = current_score
+                        reason = "minimum_hold"
+                    else:
+                        gain_pct = (
+                            (current_score.robust_cost_ms - best.robust_cost_ms)
+                            / max(current_score.robust_cost_ms, 1e-6)
+                            * 100.0
+                        )
+                        min_gain = float(
+                            getattr(
+                                self.parallel_config,
+                                "adaptive_ubatch_switch_threshold_pct",
+                                getattr(
+                                    self.parallel_config,
+                                    "adaptive_ubatch_min_gain_pct",
+                                    5.0,
+                                ),
+                            )
+                        )
+                        if gain_pct < min_gain:
+                            selected = current_score
+                            reason = "gain_below_switch_threshold"
+                            bucket_state.pending_m = None
+                            bucket_state.pending_wins = 0
+                        else:
+                            confirmations = max(
+                                1,
+                                int(
+                                    getattr(
+                                        self.parallel_config,
+                                        "adaptive_ubatch_switch_confirmations",
+                                        2,
+                                    )
+                                ),
+                            )
+                            if bucket_state.pending_m == best.m:
+                                bucket_state.pending_wins += 1
+                            else:
+                                bucket_state.pending_m = best.m
+                                bucket_state.pending_wins = 1
+                            if bucket_state.pending_wins < confirmations:
+                                selected = current_score
+                                reason = "switch_confirmation"
+                            else:
+                                selected = best
+                                bucket_state.pending_m = None
+                                bucket_state.pending_wins = 0
+
+            predicted_gain_pct = (
+                (current_score.robust_cost_ms - selected.robust_cost_ms)
+                / max(current_score.robust_cost_ms, 1e-6)
+                * 100.0
+            )
+            selected_m = _cap_candidate(
+                selected.m,
+                int(getattr(self.parallel_config, "adaptive_ubatch_max_size", 4) or 1),
+                features.total_tokens,
+            )
+            switched = selected_m != previous_m
+            if switched:
+                self._last_change_step = self._step_id
+                self._current_m = selected_m
+                bucket_state.last_change_step = self._step_id
+                bucket_state.current_m = selected_m
+                bucket_state.pending_m = None
+                bucket_state.pending_wins = 0
+            else:
+                self._current_m = previous_m
+                bucket_state.current_m = previous_m
+
+            overhead_us = (time.perf_counter_ns() - start_ns) / 1000.0
+            decision = AdaptiveUBatchDecision(
+                num_ubatches=selected_m,
+                predicted_gain_pct=max(0.0, predicted_gain_pct),
+                reason=reason,
+                bucket_key=bucket.as_tuple(),
+                total_tokens=features.total_tokens,
+                online=True,
+                num_reqs=features.num_reqs,
+                predicted_cost_ms=selected.calibrated_cost_ms,
+                robust_cost_ms=selected.robust_cost_ms,
+                previous_m=previous_m,
+                switched=switched,
+                fallback=fallback,
+                decision_overhead_us=overhead_us,
+                candidate_scores=tuple(s.to_payload() for s in scores),
+            )
+            self._write_trace({
+                "type": "adaptive_ubatch_decision",
+                "step_id": self._step_id,
+                "bucket": bucket.as_tuple(),
+                "features": {
+                    "total_tokens": features.total_tokens,
+                    "num_reqs": features.num_reqs,
+                    "prefill_ratio": features.prefill_ratio,
+                    "model_billions": features.model_billions,
+                },
+                "previous_m": previous_m,
+                "selected_m": selected_m,
+                "predicted_gain_pct": decision.predicted_gain_pct,
+                "switched": switched,
+                "fallback": fallback,
+                "reason": reason,
+                "pending_m": bucket_state.pending_m,
+                "pending_wins": bucket_state.pending_wins,
+                "candidates": list(decision.candidate_scores),
+                "decision_overhead_us": overhead_us,
+            })
+            return decision
+
+    def observe(
+        self,
+        decision: AdaptiveUBatchDecision,
+        *,
+        forward_ms: float,
+    ) -> None:
+        with self._lock:
+            if decision is None:
+                return
+            actual_ms = float(forward_ms)
+            predicted_ms = (
+                float(decision.predicted_cost_ms)
+                if decision.predicted_cost_ms is not None
+                else None
+            )
+            if not _is_finite_positive(actual_ms) or not _is_finite_positive(
+                predicted_ms
+            ):
+                self.observe_failure(decision, reason="invalid_observation")
+                return
+            bucket = WorkloadBucket.from_key(decision.bucket_key)
+            m = max(1, int(decision.num_ubatches))
+            bucket_state = self._decision_state(bucket)
+            selected_candidate = next(
+                (
+                    candidate
+                    for candidate in decision.candidate_scores
+                    if int(candidate.get("m", -1)) == m
+                ),
+                None,
+            )
+            prior_ms = (
+                float(selected_candidate["prior_ms"])
+                if selected_candidate is not None
+                and _is_finite_positive(
+                    _optional_float(selected_candidate.get("prior_ms"))
+                )
+                else predicted_ms
+            )
+            error_ms = actual_ms - predicted_ms
+            alpha = self._alpha()
+            prior_state_count = self._lookup_state(bucket, m).count
+            self._state(bucket, m).update(
+                error_ms=error_ms,
+                predicted_ms=predicted_ms,
+                prior_ms=prior_ms,
+                actual_ms=actual_ms,
+                step_id=self._step_id,
+                alpha=alpha,
+            )
+            degradation_pct = error_ms / max(predicted_ms, 1e-6) * 100.0
+            bad_threshold = float(
+                getattr(self.parallel_config, "adaptive_ubatch_bad_threshold_pct", 8.0)
+            )
+            safe_m = max(
+                1,
+                int(getattr(self.parallel_config, "adaptive_ubatch_safe_m", 1)),
+            )
+            has_alternative = len(decision.candidate_scores) > 1
+            enough_observations = prior_state_count >= self._min_observations()
+            bad_execution = (
+                has_alternative
+                and enough_observations
+                and degradation_pct > bad_threshold
+            )
+            if bad_execution and m != safe_m:
+                bucket_state.bad_streak += 1
+                self._cooldown_until[(bucket.as_tuple(), m)] = (
+                    self._step_id
+                    + int(getattr(self.parallel_config, "adaptive_ubatch_cooldown_steps", 8))
+                )
+            else:
+                bucket_state.bad_streak = 0
+            self._write_trace({
+                "type": "adaptive_ubatch_observation",
+                "step_id": self._step_id,
+                "bucket": bucket.as_tuple(),
+                "selected_m": m,
+                "prior_ms": prior_ms,
+                "calibration_scale": predicted_ms / max(prior_ms, 1e-6),
+                "predicted_ms": predicted_ms,
+                "actual_ms": actual_ms,
+                "error_ms": error_ms,
+                "degradation_pct": degradation_pct,
+                "bad_execution": bad_execution,
+                "has_alternative": has_alternative,
+                "enough_observations": enough_observations,
+                "affects_cooldown": bad_execution and m != safe_m,
+            })
+
+    def observe_failure(
+        self,
+        decision: AdaptiveUBatchDecision | None,
+        *,
+        reason: str = "runtime_exception",
+    ) -> None:
+        with self._lock:
+            if decision is None:
+                return
+            bucket = WorkloadBucket.from_key(decision.bucket_key)
+            m = max(1, int(decision.num_ubatches))
+            bucket_state = self._decision_state(bucket)
+            bucket_state.bad_streak += 1
+            safe_m = max(
+                1,
+                int(getattr(self.parallel_config, "adaptive_ubatch_safe_m", 1)),
+            )
+            affects_cooldown = m != safe_m
+            if affects_cooldown:
+                self._cooldown_until[(bucket.as_tuple(), m)] = (
+                    self._step_id
+                    + int(
+                        getattr(
+                            self.parallel_config,
+                            "adaptive_ubatch_failure_cooldown_steps",
+                            32,
+                        )
+                    )
+                )
+            self._current_m = safe_m
+            bucket_state.current_m = safe_m
+            bucket_state.pending_m = None
+            bucket_state.pending_wins = 0
+            self._write_trace({
+                "type": "adaptive_ubatch_runtime_failure",
+                "step_id": self._step_id,
+                "bucket": bucket.as_tuple(),
+                "selected_m": m,
+                "fallback_m": self._current_m,
+                "reason": reason,
+                "affects_cooldown": affects_cooldown,
+            })

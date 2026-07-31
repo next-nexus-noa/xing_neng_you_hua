@@ -1,0 +1,39 @@
+Trace file: /workspace/vllm_ascend_pp_trace.jsonl
+Rank timelines: 926
+Dual PP metrics: 463
+
+Dual-card PP summary
+  steps              : 458 (step 461..918)
+  tokens range       : 1..2048
+  makespan avg/p50/p95:  677.557 ms /  514.076 ms / 1487.981 ms
+  bubble ratio avg/p50/p95:   55.60% /   51.99% /   69.85%
+  compute overlap avg/max:   46.09% /   52.67%
+  compute util avg rank0/rank1:   44.54% /   44.26%
+  active util avg rank0/rank1 :   50.46% /   99.97%
+  compute ms avg rank0/rank1  :  320.520 ms /  318.917 ms
+  verdict            : visible compute overlap.
+
+Stage duration averages
+  PP rank 0:
+    worker.model_runner_execute      avg= 380.970 ms p95= 996.334 ms n=463
+    runner.forward.microbatch.0      avg= 185.107 ms p95= 490.620 ms n=463
+    runner.forward.microbatch.1      avg= 137.295 ms p95= 270.719 ms n=458
+    runner.send.microbatch.1         avg=  51.308 ms p95= 235.960 ms n=458
+    runner.prepare_input             avg=   5.141 ms p95=   7.961 ms n=463
+    runner.send.microbatch.0         avg=   3.147 ms p95=   4.665 ms n=463
+    runner.preprocess                avg=   0.017 ms p95=   0.021 ms n=463
+    worker.wait_prev_pp_send         avg=   0.015 ms p95=   0.019 ms n=434
+    worker.sample_tokens             avg=   0.008 ms p95=   0.010 ms n=463
+    runner.recv.microbatch.1         avg=   0.003 ms p95=   0.004 ms n=458
+  PP rank 1:
+    worker.model_runner_execute      avg= 524.531 ms p95=1273.801 ms n=463
+    runner.recv.microbatch.0         avg= 189.463 ms p95= 495.127 ms n=463
+    runner.forward.microbatch.0      avg= 184.376 ms p95= 490.576 ms n=463
+    worker.sample_tokens             avg= 151.651 ms p95= 277.899 ms n=463
+    runner.sample                    avg= 150.547 ms p95= 276.177 ms n=463
+    runner.forward.microbatch.1      avg= 136.370 ms p95= 270.002 ms n=458
+    runner.post_process              avg=   6.818 ms p95=   7.275 ms n=463
+    runner.prepare_input             avg=   5.183 ms p95=   8.048 ms n=463
+    runner.recv.microbatch.1         avg=   2.758 ms p95=   4.193 ms n=458
+    runner.bookkeeping               avg=   0.375 ms p95=   0.518 ms n=463
+
