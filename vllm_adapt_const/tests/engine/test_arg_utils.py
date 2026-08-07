@@ -449,6 +449,40 @@ def test_prefix_cache_default():
     assert not engine_args.enable_prefix_caching
 
 
+def test_adaptive_ubatch_queue_safety_cli_args():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args(
+        [
+            "--adaptive-ubatch-queue-safety-enabled",
+            "--adaptive-ubatch-queue-growth-threshold",
+            "3",
+            "--adaptive-ubatch-regret-budget-pct",
+            "1.5",
+            "--adaptive-ubatch-regret-window-steps",
+            "48",
+            "--adaptive-ubatch-context-min-observations",
+            "4",
+            "--adaptive-ubatch-context-forgetting-factor",
+            "0.95",
+            "--adaptive-ubatch-context-change-threshold",
+            "0.25",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.adaptive_ubatch_queue_safety_enabled
+    assert engine_args.adaptive_ubatch_queue_growth_threshold == 3
+    assert engine_args.adaptive_ubatch_regret_budget_pct == 1.5
+    assert engine_args.adaptive_ubatch_regret_window_steps == 48
+    assert engine_args.adaptive_ubatch_context_min_observations == 4
+    assert engine_args.adaptive_ubatch_context_forgetting_factor == 0.95
+    assert engine_args.adaptive_ubatch_context_change_threshold == 0.25
+
+    args = parser.parse_args(["--no-adaptive-ubatch-queue-safety-enabled"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert not engine_args.adaptive_ubatch_queue_safety_enabled
+
+
 @pytest.mark.parametrize(
     ("arg", "expected", "option"),
     [

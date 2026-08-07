@@ -8,12 +8,18 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any
 
 import numpy as np
 import regex as re
+
+CONTEXT_TOKEN_LOG_NORMALIZER = 9.0
+CONTEXT_REQUEST_LOG_NORMALIZER = 6.0
+CONTEXT_MODEL_LOG_NORMALIZER = 4.0
+CONTEXT_DIMENSION = 11
 
 
 @dataclass(frozen=True)
@@ -116,6 +122,111 @@ class CalibrationState:
         self.last_prior_ms = prior_ms
         self.last_update_step = step_id
 
+
+@dataclass
+class ContextualCostState:
+    """Recursive least-squares model for a log-cost response."""
+
+    dimension: int
+    count: int = 0
+    coefficients: np.ndarray = field(init=False)
+    covariance: np.ndarray = field(init=False)
+    residual_variance: float = 0.0
+    last_update_step: int = -1
+
+    def __post_init__(self) -> None:
+        self.coefficients = np.zeros(self.dimension, dtype=np.float64)
+        self.covariance = np.eye(self.dimension, dtype=np.float64) * 4.0
+
+    def predict(self, context: np.ndarray) -> tuple[float, float]:
+        mean = float(context @ self.coefficients)
+        leverage = max(0.0, float(context @ self.covariance @ context))
+        residual_sigma = math.sqrt(max(0.0, self.residual_variance))
+        # We decide using uncertainty in the expected response, not a
+        # prediction interval for one noisy execution. Including the
+        # irreducible ``+1`` term made a small, consistently beneficial arm
+        # impossible to prove even after repeated observations.
+        uncertainty = residual_sigma * math.sqrt(leverage)
+        return mean, uncertainty
+
+    def update(
+        self,
+        *,
+        context: np.ndarray,
+        target: float,
+        forgetting_factor: float,
+        alpha: float,
+        step_id: int,
+    ) -> None:
+        prediction = float(context @ self.coefficients)
+        error = target - prediction
+        covariance_context = self.covariance @ context
+        denominator = max(
+            1e-9,
+            forgetting_factor + float(context @ covariance_context),
+        )
+        gain = covariance_context / denominator
+        self.coefficients += gain * error
+        self.covariance = (
+            self.covariance
+            - np.outer(gain, context) @ self.covariance
+        ) / forgetting_factor
+        squared_error = error * error
+        if self.count == 0:
+            self.residual_variance = squared_error
+        else:
+            self.residual_variance = (
+                alpha * squared_error
+                + (1.0 - alpha) * self.residual_variance
+            )
+        self.count += 1
+        self.last_update_step = step_id
+
+
+@dataclass(frozen=True)
+class PendingContextualOutcome:
+    bucket_key: tuple[str, str, str]
+    selected_m: int
+    context: tuple[float, ...]
+    prior_ms: float
+    actual_ms: float
+    baseline_ms: float
+    queue_depth: int | None
+    waiting_reqs: int | None
+
+
+@dataclass
+class RegretWindowState:
+    entries: deque[tuple[float, float]] = field(default_factory=deque)
+    queue_bad_streak: int = 0
+
+    def add(
+        self,
+        *,
+        regret_ms: float,
+        baseline_ms: float,
+        window_steps: int,
+    ) -> None:
+        self.entries.append((max(0.0, regret_ms), max(1e-6, baseline_ms)))
+        while len(self.entries) > window_steps:
+            self.entries.popleft()
+
+    def regret_pct(self) -> float:
+        if not self.entries:
+            return 0.0
+        regret = sum(entry[0] for entry in self.entries)
+        baseline = sum(entry[1] for entry in self.entries)
+        return regret / max(baseline, 1e-6) * 100.0
+
+
+@dataclass
+class ContextRegimeState:
+    ewma_context: tuple[float, ...] | None = None
+    stable_observations: int = 0
+    change_streak: int = 0
+    warming_up: bool = False
+
+
 @dataclass
 class BucketDecisionState:
     current_m: int
@@ -175,6 +286,12 @@ class AdaptiveUBatchDecision:
     fallback: bool = False
     decision_overhead_us: float | None = None
     candidate_scores: tuple[dict[str, Any], ...] = ()
+    queue_depth: int | None = None
+    waiting_reqs: int | None = None
+    context_vector: tuple[float, ...] = ()
+    contextual_baseline_ms: float | None = None
+    contextual_gain_lcb_pct: float | None = None
+    contextual_regret_pct: float = 0.0
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -192,6 +309,12 @@ class AdaptiveUBatchDecision:
             "fallback": self.fallback,
             "decision_overhead_us": self.decision_overhead_us,
             "candidate_scores": list(self.candidate_scores),
+            "queue_depth": self.queue_depth,
+            "waiting_reqs": self.waiting_reqs,
+            "context_vector": list(self.context_vector),
+            "contextual_baseline_ms": self.contextual_baseline_ms,
+            "contextual_gain_lcb_pct": self.contextual_gain_lcb_pct,
+            "contextual_regret_pct": self.contextual_regret_pct,
         }
 
     @classmethod
@@ -216,6 +339,20 @@ class AdaptiveUBatchDecision:
                 payload.get("decision_overhead_us")
             ),
             candidate_scores=tuple(payload.get("candidate_scores", ())),
+            queue_depth=_optional_int(payload.get("queue_depth")),
+            waiting_reqs=_optional_int(payload.get("waiting_reqs")),
+            context_vector=tuple(
+                float(value) for value in payload.get("context_vector", ())
+            ),
+            contextual_baseline_ms=_optional_float(
+                payload.get("contextual_baseline_ms")
+            ),
+            contextual_gain_lcb_pct=_optional_float(
+                payload.get("contextual_gain_lcb_pct")
+            ),
+            contextual_regret_pct=float(
+                payload.get("contextual_regret_pct", 0.0)
+            ),
         )
 
 
@@ -265,6 +402,12 @@ def _with_feature_counts(
         fallback=decision.fallback,
         decision_overhead_us=decision.decision_overhead_us,
         candidate_scores=decision.candidate_scores,
+        queue_depth=decision.queue_depth,
+        waiting_reqs=decision.waiting_reqs,
+        context_vector=decision.context_vector,
+        contextual_baseline_ms=decision.contextual_baseline_ms,
+        contextual_gain_lcb_pct=decision.contextual_gain_lcb_pct,
+        contextual_regret_pct=decision.contextual_regret_pct,
     )
 
 
@@ -505,10 +648,11 @@ def _effective_overlap(m: int, features: AdaptiveUBatchFeatures) -> float:
     return max(1.0, min(float(m), base))
 
 
-def _analytical_cost_ms(
+def _analytical_serial_cost_ms(
     m: int,
     features: AdaptiveUBatchFeatures,
 ) -> float:
+    """Return modeled work before applying pipeline overlap."""
     params = _analytical_params_for_model(features.model_billions)
     total_tokens = max(1.0, float(features.total_tokens))
     decode_tokens = max(0.0, float(features.decode_tokens))
@@ -516,13 +660,70 @@ def _analytical_cost_ms(
     compute = (
         params.alpha
         * total_tokens
-        * (1.0 + (m_float * params.beta) /
-           (total_tokens + m_float * params.gamma))
+        * (
+            1.0
+            + (m_float * params.beta)
+            / (total_tokens + m_float * params.gamma)
+        )
     )
-    comm = m_float * params.delta + params.epsilon * total_tokens * features.hidden_size
+    comm = (
+        m_float * params.delta
+        + params.epsilon * total_tokens * features.hidden_size
+    )
     sample = params.sigma * decode_tokens
-    step_ms = compute + comm + sample
-    return step_ms / _effective_overlap(m, features)
+    return compute + comm + sample
+
+
+def _analytical_cost_ms(
+    m: int,
+    features: AdaptiveUBatchFeatures,
+) -> float:
+    return _analytical_serial_cost_ms(m, features) / _effective_overlap(
+        m,
+        features,
+    )
+
+
+def _context_vector(
+    features: AdaptiveUBatchFeatures,
+    *,
+    queue_depth: int | None,
+    waiting_reqs: int | None,
+) -> tuple[float, ...]:
+    """Build a continuous workload and congestion context."""
+    prefill_request_share = features.prefill_reqs / max(1, features.num_reqs)
+    queue = max(0, int(queue_depth or 0))
+    waiting = max(0, int(waiting_reqs or 0))
+    return (
+        1.0,
+        math.log1p(max(0.0, features.model_billions))
+        / CONTEXT_MODEL_LOG_NORMALIZER,
+        math.log1p(max(0, features.total_tokens))
+        / CONTEXT_TOKEN_LOG_NORMALIZER,
+        math.log1p(max(0, features.num_reqs))
+        / CONTEXT_REQUEST_LOG_NORMALIZER,
+        math.log1p(max(0, features.max_query_len))
+        / CONTEXT_TOKEN_LOG_NORMALIZER,
+        math.log1p(max(0.0, features.avg_tokens_per_req))
+        / CONTEXT_TOKEN_LOG_NORMALIZER,
+        max(0.0, min(1.0, features.prefill_ratio)),
+        max(0.0, min(1.0, prefill_request_share)),
+        math.log1p(queue) / CONTEXT_REQUEST_LOG_NORMALIZER,
+        math.log1p(waiting) / CONTEXT_REQUEST_LOG_NORMALIZER,
+        min(1.0, waiting / max(1, queue)),
+    )
+
+
+def _context_distance(
+    first: tuple[float, ...],
+    second: tuple[float, ...],
+) -> float:
+    if len(first) != len(second) or not first:
+        return float("inf")
+    return math.sqrt(
+        sum((left - right) ** 2 for left, right in zip(first[1:], second[1:]))
+        / max(1, len(first) - 1)
+    )
 
 
 def _candidate_ms(
@@ -719,12 +920,11 @@ def select_adaptive_ubatch_count(
 
 
 class AdaptiveUBatchController:
-    """Trace-calibrated risk-aware micro-batch degree controller.
+    """Adaptive micro-batch controller with a contextual safety layer.
 
-    The analytical cost model remains the cold-start prior. Runtime
-    observations update per-(bucket, M) EWMA prediction error and residual
-    variance, allowing later decisions to use calibrated and risk-penalized
-    costs while preserving an analytical-only mode for ablations.
+    The calibrated analytical policy proposes an M. Contextual relative-cost
+    estimates, a rolling regret budget versus safe M, workload-change
+    detection, and multi-step queue drift then decide whether to execute it.
     """
 
     def __init__(
@@ -750,6 +950,14 @@ class AdaptiveUBatchController:
             tuple[tuple[str, str, str], int],
             CalibrationState,
         ] = {}
+        self._contextual_cost: dict[int, ContextualCostState] = {}
+        self._regret_windows: dict[
+            tuple[str, str, str], RegretWindowState
+        ] = {}
+        self._context_regimes: dict[
+            tuple[str, str, str], ContextRegimeState
+        ] = {}
+        self._pending_contextual_outcome: PendingContextualOutcome | None = None
         self._cooldown_until: dict[
             tuple[tuple[str, str, str], int],
             int,
@@ -776,7 +984,7 @@ class AdaptiveUBatchController:
             getattr(
                 self.parallel_config,
                 "adaptive_ubatch_mode",
-                "calibrated_risk_aware",
+                "contextual_safe",
             )
         )
 
@@ -805,6 +1013,29 @@ class AdaptiveUBatchController:
         if state is None:
             state = CalibrationState()
             self._calibration[key] = state
+        return state
+
+    def _contextual_state(self, m: int) -> ContextualCostState:
+        state = self._contextual_cost.get(m)
+        if state is None:
+            state = ContextualCostState(dimension=CONTEXT_DIMENSION)
+            self._contextual_cost[m] = state
+        return state
+
+    def _regret_state(self, bucket: WorkloadBucket) -> RegretWindowState:
+        key = bucket.as_tuple()
+        state = self._regret_windows.get(key)
+        if state is None:
+            state = RegretWindowState()
+            self._regret_windows[key] = state
+        return state
+
+    def _regime_state(self, bucket: WorkloadBucket) -> ContextRegimeState:
+        key = bucket.as_tuple()
+        state = self._context_regimes.get(key)
+        if state is None:
+            state = ContextRegimeState()
+            self._context_regimes[key] = state
         return state
 
     def _decision_state(self, bucket: WorkloadBucket) -> BucketDecisionState:
@@ -882,6 +1113,591 @@ class AdaptiveUBatchController:
             uncertainty += calibrated * penalty_ratio * max(0.0, scarcity)
         return uncertainty
 
+    def _predict_safe_contextual_cost(
+        self,
+        *,
+        score: CandidateScore,
+        context: np.ndarray,
+    ) -> tuple[float, float, int]:
+        state = self._contextual_state(score.m)
+        log_scale, uncertainty = state.predict(context)
+        max_scale = max(
+            1.0,
+            float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_max_calibration_scale",
+                    8.0,
+                )
+            ),
+        )
+        log_limit = math.log(max_scale)
+        log_scale = max(-log_limit, min(log_limit, log_scale))
+        min_observations = max(
+            1,
+            int(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_context_min_observations",
+                    3,
+                )
+            ),
+        )
+        if state.count < min_observations:
+            scarcity = 1.0 - state.count / min_observations
+            uncertainty += float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_cold_start_penalty_ratio",
+                    0.15,
+                )
+            ) * scarcity
+        cost_ms = max(1e-6, score.prior_cost_ms * math.exp(log_scale))
+        return cost_ms, max(0.0, uncertainty), state.count
+
+    def _predict_relative_candidate(
+        self,
+        *,
+        score: CandidateScore,
+        safe_score: CandidateScore,
+        context: np.ndarray,
+    ) -> tuple[float, float, int]:
+        """Predict T(M) / T(safe M) directly in log space."""
+        state = self._contextual_state(score.m)
+        if state.count == 0:
+            relative_ratio = score.robust_cost_ms / max(
+                safe_score.robust_cost_ms,
+                1e-6,
+            )
+            log_uncertainty = 0.0
+        else:
+            log_ratio, log_uncertainty = state.predict(context)
+            max_scale = max(
+                1.0,
+                float(
+                    getattr(
+                        self.parallel_config,
+                        "adaptive_ubatch_max_calibration_scale",
+                        8.0,
+                    )
+                ),
+            )
+            log_limit = math.log(max_scale)
+            log_ratio = max(-log_limit, min(log_limit, log_ratio))
+            relative_ratio = math.exp(log_ratio)
+        min_observations = max(
+            1,
+            int(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_context_min_observations",
+                    3,
+                )
+            ),
+        )
+        if state.count < min_observations:
+            scarcity = 1.0 - state.count / min_observations
+            log_uncertainty += float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_cold_start_penalty_ratio",
+                    0.15,
+                )
+            ) * scarcity
+        return (
+            max(1e-6, relative_ratio),
+            max(0.0, log_uncertainty),
+            state.count,
+        )
+
+    def _update_context_regime(
+        self,
+        *,
+        bucket: WorkloadBucket,
+        context: tuple[float, ...],
+    ) -> tuple[bool, float]:
+        state = self._regime_state(bucket)
+        if state.ewma_context is None:
+            state.ewma_context = context
+            state.stable_observations = 1
+            return False, 0.0
+        distance = _context_distance(state.ewma_context, context)
+        threshold = float(
+            getattr(
+                self.parallel_config,
+                "adaptive_ubatch_context_change_threshold",
+                0.12,
+            )
+        )
+        alpha = self._alpha()
+        if distance > threshold:
+            state.change_streak += 1
+            # Stability is local to this contextual bucket.  An intervening
+            # decode/other bucket must not erase prior stable visits, but a
+            # material change within this bucket must make it safe again.
+            state.stable_observations = 0
+            state.warming_up = True
+            confirmations = max(
+                2,
+                int(
+                    getattr(
+                        self.parallel_config,
+                        "adaptive_ubatch_switch_confirmations",
+                        2,
+                    )
+                ),
+            )
+            if state.change_streak >= confirmations:
+                state.ewma_context = context
+                state.stable_observations = 1
+                state.change_streak = 0
+        else:
+            state.change_streak = 0
+            state.ewma_context = tuple(
+                alpha * current + (1.0 - alpha) * previous
+                for previous, current in zip(state.ewma_context, context)
+            )
+            state.stable_observations += 1
+            stable_required = max(
+                1,
+                int(
+                    getattr(
+                        self.parallel_config,
+                        "adaptive_ubatch_exploration_stable_steps",
+                        8,
+                    )
+                ),
+            )
+            if state.stable_observations >= stable_required:
+                state.warming_up = False
+        return (state.warming_up, distance)
+
+    def _finalize_contextual_outcome(
+        self,
+        *,
+        queue_depth: int | None,
+        waiting_reqs: int | None,
+    ) -> None:
+        pending = self._pending_contextual_outcome
+        self._pending_contextual_outcome = None
+        if pending is None:
+            return
+        context = np.asarray(pending.context, dtype=np.float64)
+        state = self._contextual_state(pending.selected_m)
+        safe_m = max(
+            1,
+            int(getattr(self.parallel_config, "adaptive_ubatch_safe_m", 1)),
+        )
+        reference_ms = (
+            pending.prior_ms
+            if pending.selected_m == safe_m
+            else pending.baseline_ms
+        )
+        raw_target = math.log(
+            max(pending.actual_ms, 1e-9) / max(reference_ms, 1e-9)
+        )
+        # Full-worker feedback includes queueing and pipeline jitter that is
+        # not caused by M alone.  Bound each recursive-model innovation so a
+        # single noisy step cannot reverse an otherwise consistent arm.
+        predicted_target, _ = state.predict(context)
+        max_correction_ratio = max(
+            0.0,
+            float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_max_correction_ratio",
+                    0.3,
+                )
+            ),
+        )
+        innovation_limit = math.log1p(max_correction_ratio)
+        innovation = raw_target - predicted_target
+        target = predicted_target + max(
+            -innovation_limit,
+            min(innovation_limit, innovation),
+        )
+        state.update(
+            context=context,
+            target=target,
+            forgetting_factor=float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_context_forgetting_factor",
+                    0.98,
+                )
+            ),
+            alpha=self._alpha(),
+            step_id=self._step_id,
+        )
+        bucket = WorkloadBucket.from_key(pending.bucket_key)
+        regret_state = self._regret_state(bucket)
+        raw_regret_ms = (
+            max(0.0, pending.actual_ms - pending.baseline_ms)
+            if pending.selected_m != safe_m
+            else 0.0
+        )
+        max_exploration_regret_pct = max(
+            0.0,
+            float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_max_exploration_regret_pct",
+                    5.0,
+                )
+            ),
+        )
+        # Candidate-level cooldown handles a bad arm.  The bucket-level
+        # budget receives a winsorized contribution, so one outlier pauses
+        # exploration but cannot starve every other arm for the entire run.
+        regret_cap_ms = (
+            pending.baseline_ms * max_exploration_regret_pct / 100.0
+        )
+        regret_ms = min(raw_regret_ms, regret_cap_ms)
+        window_steps = max(
+            1,
+            int(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_regret_window_steps",
+                    64,
+                )
+            ),
+        )
+        regret_state.add(
+            regret_ms=regret_ms,
+            baseline_ms=pending.baseline_ms,
+            window_steps=window_steps,
+        )
+        candidate_cooldown_until = self._cooldown_until.get(
+            (bucket.as_tuple(), pending.selected_m),
+            -1,
+        )
+        raw_regret_pct = (
+            raw_regret_ms / max(pending.baseline_ms, 1e-6) * 100.0
+        )
+        if (
+            pending.selected_m != safe_m
+            and raw_regret_pct > max_exploration_regret_pct
+        ):
+            candidate_cooldown_until = self._step_id + max(
+                1,
+                int(
+                    getattr(
+                        self.parallel_config,
+                        "adaptive_ubatch_failure_cooldown_steps",
+                        32,
+                    )
+                ),
+            )
+            self._cooldown_until[
+                (bucket.as_tuple(), pending.selected_m)
+            ] = candidate_cooldown_until
+        queue_growth = (
+            queue_depth - pending.queue_depth
+            if queue_depth is not None and pending.queue_depth is not None
+            else None
+        )
+        waiting_growth = (
+            waiting_reqs - pending.waiting_reqs
+            if waiting_reqs is not None and pending.waiting_reqs is not None
+            else None
+        )
+        threshold = max(
+            0,
+            int(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_queue_growth_threshold",
+                    2,
+                )
+            ),
+        )
+        queue_regressed = (
+            pending.selected_m != safe_m
+            and bool(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_queue_safety_enabled",
+                    True,
+                )
+            )
+            and queue_growth is not None
+            and waiting_growth is not None
+            and queue_growth > threshold
+            and waiting_growth > threshold
+        )
+        regret_state.queue_bad_streak = (
+            regret_state.queue_bad_streak + 1
+            if queue_regressed
+            else max(0, regret_state.queue_bad_streak - 1)
+        )
+        confirmations = max(
+            2,
+            int(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_switch_confirmations",
+                    2,
+                )
+            ),
+        )
+        if regret_state.queue_bad_streak >= confirmations:
+            self._cooldown_until[(bucket.as_tuple(), pending.selected_m)] = (
+                self._step_id
+                + max(
+                    1,
+                    int(
+                        getattr(
+                            self.parallel_config,
+                            "adaptive_ubatch_failure_cooldown_steps",
+                            32,
+                        )
+                    ),
+                )
+            )
+            regret_state.queue_bad_streak = 0
+        self._write_trace({
+            "type": "adaptive_ubatch_contextual_observation",
+            "step_id": self._step_id,
+            "bucket": bucket.as_tuple(),
+            "selected_m": pending.selected_m,
+            "prior_ms": pending.prior_ms,
+            "actual_ms": pending.actual_ms,
+            "baseline_ms": pending.baseline_ms,
+            "relative_ratio": (
+                pending.actual_ms / max(pending.baseline_ms, 1e-9)
+            ),
+            "model_target_kind": (
+                "safe_absolute_scale"
+                if pending.selected_m == safe_m
+                else "candidate_relative_to_safe"
+            ),
+            "model_log_target": target,
+            "model_raw_log_target": raw_target,
+            "model_innovation_clipped": not math.isclose(
+                target,
+                raw_target,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            ),
+            "regret_ms": regret_ms,
+            "raw_regret_ms": raw_regret_ms,
+            "raw_regret_pct": raw_regret_pct,
+            "rolling_regret_pct": regret_state.regret_pct(),
+            "candidate_cooldown_until": candidate_cooldown_until,
+            "queue_growth": queue_growth,
+            "waiting_growth": waiting_growth,
+            "queue_regressed": queue_regressed,
+            "contextual_count": state.count,
+        })
+
+    def _apply_contextual_safety(
+        self,
+        *,
+        proposed: CandidateScore,
+        safe_score: CandidateScore,
+        candidate_scores: list[CandidateScore],
+        bucket: WorkloadBucket,
+        context: tuple[float, ...],
+        regime_warmup: bool,
+    ) -> tuple[
+        CandidateScore,
+        str,
+        float | None,
+        float,
+        float,
+        dict[int, dict[str, Any]],
+    ]:
+        context_array = np.asarray(context, dtype=np.float64)
+        safe_cost, _, safe_count = self._predict_safe_contextual_cost(
+            score=safe_score, context=context_array
+        )
+        regret_pct = self._regret_state(bucket).regret_pct()
+        risk_kappa = max(
+            0.0,
+            float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_risk_kappa",
+                    1.0,
+                )
+            ),
+        )
+        min_observations = max(
+            1,
+            int(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_context_min_observations",
+                    3,
+                )
+            ),
+        )
+        min_gain = float(
+            getattr(
+                self.parallel_config,
+                "adaptive_ubatch_min_gain_pct",
+                5.0,
+            )
+        )
+        evaluations: dict[int, dict[str, Any]] = {}
+        proven: list[tuple[float, CandidateScore]] = []
+        exploratory: list[tuple[int, float, CandidateScore]] = []
+        max_exploration_regret = max(
+            0.0,
+            float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_max_exploration_regret_pct",
+                    5.0,
+                )
+            ),
+        )
+        for score in candidate_scores:
+            if score.m == safe_score.m or score.rejected:
+                continue
+            ratio, uncertainty, count = self._predict_relative_candidate(
+                score=score,
+                safe_score=safe_score,
+                context=context_array,
+            )
+            upper_ratio = ratio * math.exp(risk_kappa * uncertainty)
+            gain_lcb_pct = (1.0 - upper_ratio) * 100.0
+            point_gain_pct = (1.0 - ratio) * 100.0
+            evaluations[score.m] = {
+                "contextual_relative_ratio": ratio,
+                "contextual_log_uncertainty": uncertainty,
+                "contextual_gain_lcb_pct": gain_lcb_pct,
+                "contextual_point_gain_pct": point_gain_pct,
+                "contextual_count": count,
+            }
+            if count >= min_observations and gain_lcb_pct >= min_gain:
+                proven.append((gain_lcb_pct, score))
+                continue
+            prior_regret_pct = (
+                (score.robust_cost_ms - safe_score.robust_cost_ms)
+                / max(safe_score.robust_cost_ms, 1e-6)
+                * 100.0
+            )
+            observed_candidate_is_plausible = (
+                count < min_observations
+                or point_gain_pct >= min_gain
+            )
+            if (
+                observed_candidate_is_plausible
+                and prior_regret_pct <= max_exploration_regret
+            ):
+                # Keep the analytical policy as the eligibility prior. Among
+                # uncertain arms, collect evidence for the least-observed and
+                # lowest-risk M first; M4 remains independently eligible after
+                # M2 has received a real (non-compilation) observation.
+                exploratory.append((count, -point_gain_pct, score))
+
+        if regime_warmup:
+            return (
+                safe_score,
+                "contextual_regime_warmup",
+                None,
+                safe_cost,
+                regret_pct,
+                evaluations,
+            )
+        budget_pct = max(
+            0.0,
+            float(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_regret_budget_pct",
+                    2.0,
+                )
+            ),
+        )
+        if regret_pct >= budget_pct:
+            return (
+                safe_score,
+                "contextual_regret_budget",
+                None,
+                safe_cost,
+                regret_pct,
+                evaluations,
+            )
+        interval = max(
+            1,
+            int(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_exploration_interval_steps",
+                    16,
+                )
+            ),
+        )
+        stable_steps = max(
+            1,
+            int(
+                getattr(
+                    self.parallel_config,
+                    "adaptive_ubatch_exploration_stable_steps",
+                    8,
+                )
+            ),
+        )
+        queue_stable = self._regret_state(bucket).queue_bad_streak == 0
+        bucket_stable_observations = self._regime_state(
+            bucket
+        ).stable_observations
+        can_explore = (
+            bool(exploratory)
+            and queue_stable
+            and safe_count >= min_observations
+            and bucket_stable_observations >= stable_steps
+            and self._step_id - self._last_explore_step >= interval
+        )
+        if can_explore:
+            self._last_explore_step = self._step_id
+            _, _, selected = min(
+                exploratory,
+                key=lambda item: (item[0], item[2].m, item[1]),
+            )
+            return (
+                selected,
+                "contextual_exploration",
+                evaluations[selected.m]["contextual_gain_lcb_pct"],
+                safe_cost,
+                regret_pct,
+                evaluations,
+            )
+        if proven:
+            gain_lcb_pct, selected = max(proven, key=lambda item: item[0])
+            return (
+                selected,
+                "contextual_proven_gain",
+                gain_lcb_pct,
+                safe_cost,
+                regret_pct,
+                evaluations,
+            )
+        best_gain = max(
+            (
+                evaluation["contextual_gain_lcb_pct"]
+                for evaluation in evaluations.values()
+            ),
+            default=None,
+        )
+        reason = (
+            "contextual_base_safe"
+            if not evaluations
+            or (proposed.m == safe_score.m and not exploratory)
+            else "contextual_insufficient_evidence"
+        )
+        return (
+            safe_score,
+            reason,
+            best_gain,
+            safe_cost,
+            regret_pct,
+            evaluations,
+        )
+
     def _score_candidates(
         self,
         *,
@@ -892,8 +1708,12 @@ class AdaptiveUBatchController:
         safe_m: int,
     ) -> list[CandidateScore]:
         mode = self._mode()
-        risk_enabled = mode == "calibrated_risk_aware"
-        calibration_enabled = mode in {"calibrated", "calibrated_risk_aware"}
+        risk_enabled = mode in {"calibrated_risk_aware", "contextual_safe"}
+        calibration_enabled = mode in {
+            "calibrated",
+            "calibrated_risk_aware",
+            "contextual_safe",
+        }
         risk_kappa = float(
             getattr(self.parallel_config, "adaptive_ubatch_risk_kappa", 1.0)
         )
@@ -921,7 +1741,11 @@ class AdaptiveUBatchController:
                 ))
                 continue
             state = self._lookup_state(bucket, m)
-            scale = self._calibration_scale(state) if calibration_enabled else 1.0
+            scale = (
+                self._calibration_scale(state)
+                if calibration_enabled
+                else 1.0
+            )
             calibrated = max(1e-6, prior * scale)
             correction = calibrated - prior
             uncertainty = (
@@ -940,7 +1764,7 @@ class AdaptiveUBatchController:
                 ):
                     rejected = True
                     rejection_reason = "cooldown"
-                elif (
+                elif mode == "calibrated_risk_aware" and (
                     state.count >= self._min_observations()
                     and uncertainty / max(calibrated, 1e-6) > max_uncertainty_ratio
                     and m not in {current_m, safe_m}
@@ -1132,6 +1956,12 @@ class AdaptiveUBatchController:
                 fallback=decision.fallback if fallback is None else fallback,
                 decision_overhead_us=decision.decision_overhead_us,
                 candidate_scores=decision.candidate_scores,
+                queue_depth=decision.queue_depth,
+                waiting_reqs=decision.waiting_reqs,
+                context_vector=decision.context_vector,
+                contextual_baseline_ms=decision.contextual_baseline_ms,
+                contextual_gain_lcb_pct=decision.contextual_gain_lcb_pct,
+                contextual_regret_pct=decision.contextual_regret_pct,
             )
 
     def observe_rejection(
@@ -1179,6 +2009,9 @@ class AdaptiveUBatchController:
     def select(
         self,
         num_scheduled_tokens: np.ndarray | list[int],
+        *,
+        queue_depth: int | None = None,
+        waiting_reqs: int | None = None,
     ) -> AdaptiveUBatchDecision:
         start_ns = time.perf_counter_ns()
         with self._lock:
@@ -1188,6 +2021,23 @@ class AdaptiveUBatchController:
                 num_scheduled_tokens=num_scheduled_tokens,
             )
             bucket = WorkloadBucket.from_key(features.bucket_key)
+            contextual_mode = self._mode() == "contextual_safe"
+            context = _context_vector(
+                features,
+                queue_depth=queue_depth,
+                waiting_reqs=waiting_reqs,
+            )
+            regime_warmup = False
+            context_distance = 0.0
+            if contextual_mode:
+                self._finalize_contextual_outcome(
+                    queue_depth=queue_depth,
+                    waiting_reqs=waiting_reqs,
+                )
+                regime_warmup, context_distance = self._update_context_regime(
+                    bucket=bucket,
+                    context=context,
+                )
             if self._last_bucket == bucket:
                 self._stable_bucket_steps += 1
             else:
@@ -1227,6 +2077,17 @@ class AdaptiveUBatchController:
                             count=calibration.count,
                         ).to_payload(),
                     ),
+                    queue_depth=queue_depth,
+                    waiting_reqs=waiting_reqs,
+                    context_vector=context if contextual_mode else (),
+                    contextual_baseline_ms=(
+                        calibrated_ms if contextual_mode else None
+                    ),
+                    contextual_regret_pct=(
+                        self._regret_state(bucket).regret_pct()
+                        if contextual_mode
+                        else 0.0
+                    ),
                 )
                 self._write_trace({
                     "type": "adaptive_ubatch_ineligible",
@@ -1246,6 +2107,8 @@ class AdaptiveUBatchController:
                         "decode_reqs": features.decode_reqs,
                         "prefill_ratio": features.prefill_ratio,
                         "model_billions": features.model_billions,
+                        "queue_depth": queue_depth,
+                        "waiting_reqs": waiting_reqs,
                     },
                 })
                 return decision
@@ -1303,6 +2166,10 @@ class AdaptiveUBatchController:
             )
             if current_score is None:
                 current_score = next((s for s in scores if s.m == safe_m), scores[0])
+            safe_score = next(
+                (score for score in scores if score.m == safe_m),
+                None,
+            )
 
             reason = "robust_cost_improvement"
             fallback = False
@@ -1335,9 +2202,7 @@ class AdaptiveUBatchController:
                     for score in valid_scores
                     if score.count < calibration_target
                 ]
-                if selected is not None:
-                    pass
-                elif (
+                if (
                     calibration_target > 0
                     and len(valid_scores) > 1
                     and under_observed
@@ -1472,6 +2337,30 @@ class AdaptiveUBatchController:
                                     bucket_state.pending_m = None
                                     bucket_state.pending_wins = 0
 
+            contextual_gain_lcb_pct = None
+            contextual_baseline_ms = None
+            contextual_regret_pct = 0.0
+            contextual_evaluations: dict[int, dict[str, Any]] = {}
+            if contextual_mode and safe_score is not None:
+                (
+                    selected,
+                    reason,
+                    contextual_gain_lcb_pct,
+                    contextual_baseline_ms,
+                    contextual_regret_pct,
+                    contextual_evaluations,
+                ) = self._apply_contextual_safety(
+                    proposed=selected,
+                    safe_score=safe_score,
+                    candidate_scores=valid_scores,
+                    bucket=bucket,
+                    context=context,
+                    regime_warmup=regime_warmup,
+                )
+                if selected.m == safe_m:
+                    bucket_state.pending_m = None
+                    bucket_state.pending_wins = 0
+
             predicted_gain_pct = (
                 (current_score.robust_cost_ms - selected.robust_cost_ms)
                 / max(current_score.robust_cost_ms, 1e-6)
@@ -1509,7 +2398,19 @@ class AdaptiveUBatchController:
                 switched=switched,
                 fallback=fallback,
                 decision_overhead_us=overhead_us,
-                candidate_scores=tuple(s.to_payload() for s in scores),
+                candidate_scores=tuple(
+                    {
+                        **score.to_payload(),
+                        **contextual_evaluations.get(score.m, {}),
+                    }
+                    for score in scores
+                ),
+                queue_depth=queue_depth,
+                waiting_reqs=waiting_reqs,
+                context_vector=context if contextual_mode else (),
+                contextual_baseline_ms=contextual_baseline_ms,
+                contextual_gain_lcb_pct=contextual_gain_lcb_pct,
+                contextual_regret_pct=contextual_regret_pct,
             )
             self._write_trace({
                 "type": "adaptive_ubatch_decision",
@@ -1524,6 +2425,8 @@ class AdaptiveUBatchController:
                     "decode_reqs": features.decode_reqs,
                     "prefill_ratio": features.prefill_ratio,
                     "model_billions": features.model_billions,
+                    "queue_depth": queue_depth,
+                    "waiting_reqs": waiting_reqs,
                 },
                 "previous_m": previous_m,
                 "selected_m": selected_m,
@@ -1531,6 +2434,15 @@ class AdaptiveUBatchController:
                 "switched": switched,
                 "fallback": fallback,
                 "reason": reason,
+                "context_distance": context_distance,
+                "contextual_stable_observations": (
+                    self._regime_state(bucket).stable_observations
+                    if contextual_mode
+                    else None
+                ),
+                "contextual_gain_lcb_pct": contextual_gain_lcb_pct,
+                "contextual_baseline_ms": contextual_baseline_ms,
+                "contextual_regret_pct": contextual_regret_pct,
                 "pending_m": bucket_state.pending_m,
                 "pending_wins": bucket_state.pending_wins,
                 "candidates": list(decision.candidate_scores),
@@ -1579,8 +2491,10 @@ class AdaptiveUBatchController:
             )
             has_alternative = len(decision.candidate_scores) > 1
             cold_key = (bucket.as_tuple(), m)
+            decision_reason = decision.reason.split(";", maxsplit=1)[0]
             if (
-                decision.reason == "candidate_calibration"
+                decision_reason
+                in {"candidate_calibration", "contextual_exploration"}
                 and has_alternative
                 and cold_key not in self._discarded_cold_samples
             ):
@@ -1608,6 +2522,20 @@ class AdaptiveUBatchController:
                 step_id=self._step_id,
                 alpha=alpha,
             )
+            contextual_mode = self._mode() == "contextual_safe"
+            if contextual_mode and decision.context_vector:
+                baseline_ms = decision.contextual_baseline_ms
+                if _is_finite_positive(baseline_ms):
+                    self._pending_contextual_outcome = PendingContextualOutcome(
+                        bucket_key=bucket.as_tuple(),
+                        selected_m=m,
+                        context=decision.context_vector,
+                        prior_ms=prior_ms,
+                        actual_ms=actual_ms,
+                        baseline_ms=float(baseline_ms),
+                        queue_depth=decision.queue_depth,
+                        waiting_reqs=decision.waiting_reqs,
+                    )
             degradation_pct = error_ms / max(predicted_ms, 1e-6) * 100.0
             bad_threshold = float(
                 getattr(self.parallel_config, "adaptive_ubatch_bad_threshold_pct", 8.0)
@@ -1639,7 +2567,8 @@ class AdaptiveUBatchController:
             relative_safe_regret_pct = None
             bad_vs_safe = False
             if (
-                m != safe_m
+                not contextual_mode
+                and m != safe_m
                 and safe_candidate is not None
                 and selected_state.count >= accepted_target
                 and safe_state.count >= accepted_target
@@ -1677,11 +2606,16 @@ class AdaptiveUBatchController:
                         relative_safe_regret_pct > regret_threshold
                     )
             enough_observations = prior_state_count >= self._min_observations()
-            bad_execution = (
+            prediction_bad_execution = (
                 has_alternative
                 and enough_observations
                 and degradation_pct > bad_threshold
             )
+            # In contextual-safe mode the relative M=1 model and rolling
+            # regret budget are authoritative. Absolute prior error is still
+            # learned by the proposal model, but must not trigger a second,
+            # conflicting safety policy.
+            bad_execution = prediction_bad_execution and not contextual_mode
             bad_non_safe = bad_execution or bad_vs_safe
             if bad_non_safe and m != safe_m:
                 bucket_state.bad_streak += 1
@@ -1730,11 +2664,13 @@ class AdaptiveUBatchController:
                 "actual_ms": actual_ms,
                 "error_ms": error_ms,
                 "degradation_pct": degradation_pct,
+                "prediction_bad_execution": prediction_bad_execution,
                 "bad_execution": bad_execution,
                 "relative_safe_regret_pct": relative_safe_regret_pct,
                 "bad_vs_safe": bad_vs_safe,
                 "has_alternative": has_alternative,
                 "enough_observations": enough_observations,
+                "contextual_pending": self._pending_contextual_outcome is not None,
                 "affects_cooldown": (
                     bad_non_safe and m != safe_m
                 ),

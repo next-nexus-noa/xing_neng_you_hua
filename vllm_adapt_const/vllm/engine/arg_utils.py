@@ -542,6 +542,27 @@ class EngineArgs:
     adaptive_ubatch_max_exploration_regret_pct: float = (
         ParallelConfig.adaptive_ubatch_max_exploration_regret_pct
     )
+    adaptive_ubatch_queue_safety_enabled: bool = (
+        ParallelConfig.adaptive_ubatch_queue_safety_enabled
+    )
+    adaptive_ubatch_queue_growth_threshold: int = (
+        ParallelConfig.adaptive_ubatch_queue_growth_threshold
+    )
+    adaptive_ubatch_regret_budget_pct: float = (
+        ParallelConfig.adaptive_ubatch_regret_budget_pct
+    )
+    adaptive_ubatch_regret_window_steps: int = (
+        ParallelConfig.adaptive_ubatch_regret_window_steps
+    )
+    adaptive_ubatch_context_min_observations: int = (
+        ParallelConfig.adaptive_ubatch_context_min_observations
+    )
+    adaptive_ubatch_context_forgetting_factor: float = (
+        ParallelConfig.adaptive_ubatch_context_forgetting_factor
+    )
+    adaptive_ubatch_context_change_threshold: float = (
+        ParallelConfig.adaptive_ubatch_context_change_threshold
+    )
     adaptive_ubatch_trace_path: str | None = ParallelConfig.adaptive_ubatch_trace_path
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
     dbo_prefill_token_threshold: int = ParallelConfig.dbo_prefill_token_threshold
@@ -1216,6 +1237,34 @@ class EngineArgs:
         parallel_group.add_argument(
             "--adaptive-ubatch-max-exploration-regret-pct",
             **parallel_kwargs["adaptive_ubatch_max_exploration_regret_pct"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-queue-safety-enabled",
+            **parallel_kwargs["adaptive_ubatch_queue_safety_enabled"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-queue-growth-threshold",
+            **parallel_kwargs["adaptive_ubatch_queue_growth_threshold"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-regret-budget-pct",
+            **parallel_kwargs["adaptive_ubatch_regret_budget_pct"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-regret-window-steps",
+            **parallel_kwargs["adaptive_ubatch_regret_window_steps"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-context-min-observations",
+            **parallel_kwargs["adaptive_ubatch_context_min_observations"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-context-forgetting-factor",
+            **parallel_kwargs["adaptive_ubatch_context_forgetting_factor"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-context-change-threshold",
+            **parallel_kwargs["adaptive_ubatch_context_change_threshold"],
         )
         parallel_group.add_argument(
             "--adaptive-ubatch-trace-path",
@@ -2151,6 +2200,27 @@ class EngineArgs:
             ),
             adaptive_ubatch_max_exploration_regret_pct=(
                 self.adaptive_ubatch_max_exploration_regret_pct
+            ),
+            adaptive_ubatch_queue_safety_enabled=(
+                self.adaptive_ubatch_queue_safety_enabled
+            ),
+            adaptive_ubatch_queue_growth_threshold=(
+                self.adaptive_ubatch_queue_growth_threshold
+            ),
+            adaptive_ubatch_regret_budget_pct=(
+                self.adaptive_ubatch_regret_budget_pct
+            ),
+            adaptive_ubatch_regret_window_steps=(
+                self.adaptive_ubatch_regret_window_steps
+            ),
+            adaptive_ubatch_context_min_observations=(
+                self.adaptive_ubatch_context_min_observations
+            ),
+            adaptive_ubatch_context_forgetting_factor=(
+                self.adaptive_ubatch_context_forgetting_factor
+            ),
+            adaptive_ubatch_context_change_threshold=(
+                self.adaptive_ubatch_context_change_threshold
             ),
             adaptive_ubatch_trace_path=self.adaptive_ubatch_trace_path,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,

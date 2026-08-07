@@ -241,8 +241,8 @@ class ParallelConfig:
     """Minimum scheduled tokens required before M=4 is considered."""
     adaptive_ubatch_min_prefill_ratio_m4: float = 0.85
     """Minimum prefill ratio required before M=4 is considered."""
-    adaptive_ubatch_mode: str = "calibrated_risk_aware"
-    """Adaptive micro-batch mode: analytical_only, calibrated, or calibrated_risk_aware."""
+    adaptive_ubatch_mode: str = "contextual_safe"
+    """Adaptive M selection and online calibration mode."""
     adaptive_ubatch_risk_kappa: float = 1.0
     """Multiplier for uncertainty in risk-aware robust cost."""
     adaptive_ubatch_max_uncertainty_ratio: float = 0.15
@@ -250,7 +250,7 @@ class ParallelConfig:
     adaptive_ubatch_cold_start_penalty_ratio: float = 0.15
     """Relative uncertainty penalty while a bucket/M has few observations."""
     adaptive_ubatch_max_correction_ratio: float = 0.3
-    """Deprecated additive-calibration compatibility option."""
+    """Maximum per-observation innovation used by contextual calibration."""
     adaptive_ubatch_max_calibration_scale: float = 8.0
     """Maximum multiplicative online calibration scale and its reciprocal."""
     adaptive_ubatch_min_hold_steps: int = 4
@@ -263,12 +263,26 @@ class ParallelConfig:
     """Accepted samples required for every eligible M before score-based selection."""
     adaptive_ubatch_safe_m: int = 1
     """Safe fallback micro-batch count."""
-    adaptive_ubatch_exploration_interval_steps: int = 32
+    adaptive_ubatch_exploration_interval_steps: int = 16
     """Minimum decision steps between controlled exploration attempts."""
     adaptive_ubatch_exploration_stable_steps: int = 8
-    """Minimum consecutive same-bucket steps before controlled exploration."""
+    """Minimum stable visits to a contextual bucket before exploration."""
     adaptive_ubatch_max_exploration_regret_pct: float = 5.0
     """Maximum predicted regret allowed for controlled exploration."""
+    adaptive_ubatch_queue_safety_enabled: bool = True
+    """Use multi-step queue drift as a latency-safety signal."""
+    adaptive_ubatch_queue_growth_threshold: int = 2
+    """Queue and waiting-request growth tolerated after a non-safe action."""
+    adaptive_ubatch_regret_budget_pct: float = 2.0
+    """Maximum rolling contextual regret relative to safe M."""
+    adaptive_ubatch_regret_window_steps: int = 64
+    """Number of measured actions in the rolling regret window."""
+    adaptive_ubatch_context_min_observations: int = 3
+    """Arm observations required before contextual exploitation."""
+    adaptive_ubatch_context_forgetting_factor: float = 0.98
+    """Recursive least-squares forgetting factor for dynamic workloads."""
+    adaptive_ubatch_context_change_threshold: float = 0.12
+    """Normalized context distance that starts a safe relearning period."""
     adaptive_ubatch_trace_path: str | None = None
     """Optional JSONL path for adaptive M decision and observation logs."""
 
@@ -517,10 +531,11 @@ class ParallelConfig:
             "analytical_only",
             "calibrated",
             "calibrated_risk_aware",
+            "contextual_safe",
         }:
             raise ValueError(
                 "adaptive_ubatch_mode must be one of: analytical_only, "
-                "calibrated, calibrated_risk_aware."
+                "calibrated, calibrated_risk_aware, contextual_safe."
             )
         if self.adaptive_ubatch_risk_kappa < 0:
             raise ValueError("adaptive_ubatch_risk_kappa must be >= 0.")
@@ -557,6 +572,30 @@ class ParallelConfig:
         if self.adaptive_ubatch_max_exploration_regret_pct < 0:
             raise ValueError(
                 "adaptive_ubatch_max_exploration_regret_pct must be >= 0."
+            )
+        if self.adaptive_ubatch_queue_growth_threshold < 0:
+            raise ValueError(
+                "adaptive_ubatch_queue_growth_threshold must be >= 0."
+            )
+        if self.adaptive_ubatch_regret_budget_pct < 0:
+            raise ValueError(
+                "adaptive_ubatch_regret_budget_pct must be >= 0."
+            )
+        if self.adaptive_ubatch_regret_window_steps < 1:
+            raise ValueError(
+                "adaptive_ubatch_regret_window_steps must be >= 1."
+            )
+        if self.adaptive_ubatch_context_min_observations < 1:
+            raise ValueError(
+                "adaptive_ubatch_context_min_observations must be >= 1."
+            )
+        if not 0 < self.adaptive_ubatch_context_forgetting_factor <= 1:
+            raise ValueError(
+                "adaptive_ubatch_context_forgetting_factor must be in (0, 1]."
+            )
+        if self.adaptive_ubatch_context_change_threshold <= 0:
+            raise ValueError(
+                "adaptive_ubatch_context_change_threshold must be > 0."
             )
         if self.adaptive_ubatch_min_tokens_m2 < 1:
             raise ValueError("adaptive_ubatch_min_tokens_m2 must be >= 1.")

@@ -343,6 +343,10 @@ class TestAdaptivePPFeedback(unittest.TestCase):
             reason="candidate_probation",
             probation=True,
         )
+        contextual_exploration = SimpleNamespace(
+            switched=False,
+            reason="contextual_exploration",
+        )
 
         self.assertFalse(runner._should_measure_adaptive_pp_critical_path(stable))
         self.assertFalse(runner._should_measure_adaptive_pp_critical_path(stable))
@@ -354,6 +358,11 @@ class TestAdaptivePPFeedback(unittest.TestCase):
         )
         self.assertTrue(
             runner._should_measure_adaptive_pp_critical_path(probation)
+        )
+        self.assertTrue(
+            runner._should_measure_adaptive_pp_critical_path(
+                contextual_exploration
+            )
         )
 
     @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")

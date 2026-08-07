@@ -238,6 +238,11 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Lightweight scheduler pressure supplied to adaptive worker policies.
+    # Defaults preserve compatibility with tests and external constructors.
+    adaptive_queue_depth: int = 0
+    adaptive_waiting_reqs: int = 0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

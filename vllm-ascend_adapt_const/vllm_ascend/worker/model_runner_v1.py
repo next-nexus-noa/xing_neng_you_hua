@@ -1958,6 +1958,9 @@ class NPUModelRunner(GPUModelRunner):
     def _select_adaptive_pp_microbatch_count(
         self,
         num_scheduled_tokens_np: np.ndarray,
+        *,
+        queue_depth: int | None = None,
+        waiting_reqs: int | None = None,
     ) -> AdaptiveUBatchDecision:
         if self.adaptive_ubatch_controller is None:
             self.adaptive_ubatch_controller = AdaptiveUBatchController(
@@ -1967,6 +1970,8 @@ class NPUModelRunner(GPUModelRunner):
             )
         decision = self.adaptive_ubatch_controller.select(
             num_scheduled_tokens_np,
+            queue_depth=queue_depth,
+            waiting_reqs=waiting_reqs,
         )
         max_count = self._pp_microbatch_configured_count()
         num_ubatches = max(1, min(decision.num_ubatches, max_count))
@@ -2019,6 +2024,12 @@ class NPUModelRunner(GPUModelRunner):
             fallback=decision.fallback if fallback is None else fallback,
             decision_overhead_us=decision.decision_overhead_us,
             candidate_scores=decision.candidate_scores,
+            queue_depth=decision.queue_depth,
+            waiting_reqs=decision.waiting_reqs,
+            context_vector=decision.context_vector,
+            contextual_baseline_ms=decision.contextual_baseline_ms,
+            contextual_gain_lcb_pct=decision.contextual_gain_lcb_pct,
+            contextual_regret_pct=decision.contextual_regret_pct,
         )
 
     def _use_mirrored_adaptive_pp_microbatch_decision(
@@ -2170,6 +2181,7 @@ class NPUModelRunner(GPUModelRunner):
             in {
                 "candidate_calibration",
                 "controlled_exploration",
+                "contextual_exploration",
             }
         )
 
@@ -2707,6 +2719,16 @@ class NPUModelRunner(GPUModelRunner):
                         local_decision = (
                             self._select_adaptive_pp_microbatch_count(
                                 num_scheduled_tokens_np,
+                                queue_depth=getattr(
+                                    scheduler_output,
+                                    "adaptive_queue_depth",
+                                    None,
+                                ),
+                                waiting_reqs=getattr(
+                                    scheduler_output,
+                                    "adaptive_waiting_reqs",
+                                    None,
+                                ),
                             )
                         )
                         adaptive_pp_decision = (
