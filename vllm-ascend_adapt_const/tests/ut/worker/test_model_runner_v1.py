@@ -347,6 +347,18 @@ class TestAdaptivePPFeedback(unittest.TestCase):
             switched=False,
             reason="contextual_exploration",
         )
+        contextual_probe_lease = SimpleNamespace(
+            switched=False,
+            reason="contextual_probe_lease",
+        )
+        contextual_pre_anchor = SimpleNamespace(
+            switched=False,
+            reason="contextual_probe_pre_anchor",
+        )
+        contextual_post_anchor = SimpleNamespace(
+            switched=False,
+            reason="contextual_probe_post_anchor",
+        )
 
         self.assertFalse(runner._should_measure_adaptive_pp_critical_path(stable))
         self.assertFalse(runner._should_measure_adaptive_pp_critical_path(stable))
@@ -362,6 +374,122 @@ class TestAdaptivePPFeedback(unittest.TestCase):
         self.assertTrue(
             runner._should_measure_adaptive_pp_critical_path(
                 contextual_exploration
+            )
+        )
+        self.assertTrue(
+            runner._should_measure_adaptive_pp_critical_path(
+                contextual_probe_lease
+            )
+        )
+        self.assertTrue(
+            runner._should_measure_adaptive_pp_critical_path(
+                contextual_pre_anchor
+            )
+        )
+        self.assertTrue(
+            runner._should_measure_adaptive_pp_critical_path(
+                contextual_post_anchor
+            )
+        )
+
+    def test_contextual_cold_start_temporarily_accelerates_feedback(self):
+        runner = self._build_runner()
+        runner.parallel_config = SimpleNamespace(
+            adaptive_ubatch_feedback_interval_steps=64,
+            adaptive_ubatch_mode="contextual_safe",
+            adaptive_ubatch_context_min_observations=3,
+        )
+        runner._pp_microbatch_configured_count = MagicMock(return_value=4)
+        cold = SimpleNamespace(
+            candidate_scores=(
+                {"m": 1, "contextual_count": 2},
+                {"m": 2, "contextual_count": 0},
+                {"m": 4, "contextual_count": 0},
+            ),
+            context_vector=(1.0,) + (0.0,) * 10,
+            switched=False,
+            reason="contextual_insufficient_evidence",
+        )
+
+        for _ in range(15):
+            self.assertFalse(
+                runner._should_measure_adaptive_pp_critical_path(cold)
+            )
+        self.assertTrue(
+            runner._should_measure_adaptive_pp_critical_path(cold)
+        )
+
+        runner._adaptive_pp_feedback_step = 0
+        calibrated_safe = SimpleNamespace(
+            candidate_scores=(
+                {"m": 1, "contextual_count": 3},
+                {"m": 2, "contextual_count": 1},
+                {"m": 4, "contextual_count": 1},
+            ),
+            context_vector=(1.0,) + (0.0,) * 10,
+            num_ubatches=1,
+            switched=False,
+            reason="contextual_queue_trend_guard",
+        )
+        for _ in range(63):
+            self.assertFalse(
+                runner._should_measure_adaptive_pp_critical_path(
+                    calibrated_safe
+                )
+            )
+        self.assertTrue(
+            runner._should_measure_adaptive_pp_critical_path(
+                calibrated_safe
+            )
+        )
+
+        runner._adaptive_pp_feedback_step = 0
+        active_candidate = SimpleNamespace(
+            candidate_scores=calibrated_safe.candidate_scores,
+            num_ubatches=2,
+            switched=False,
+            reason="contextual_bounded_gain",
+        )
+        for _ in range(63):
+            self.assertFalse(
+                runner._should_measure_adaptive_pp_critical_path(
+                    active_candidate
+                )
+            )
+        self.assertTrue(
+            runner._should_measure_adaptive_pp_critical_path(
+                active_candidate
+            )
+        )
+
+        validation_candidate = SimpleNamespace(
+            candidate_scores=calibrated_safe.candidate_scores,
+            num_ubatches=2,
+            switched=False,
+            reason="contextual_exposure_validation",
+        )
+        self.assertTrue(
+            runner._should_measure_adaptive_pp_critical_path(
+                validation_candidate
+            )
+        )
+
+        runner._adaptive_pp_feedback_step = 0
+        changed_regime = SimpleNamespace(
+            candidate_scores=calibrated_safe.candidate_scores,
+            num_ubatches=1,
+            switched=False,
+            reason="contextual_regime_warmup",
+        )
+        for _ in range(7):
+            self.assertFalse(
+                runner._should_measure_adaptive_pp_critical_path(
+                    changed_regime
+                )
+            )
+        self.assertTrue(
+            runner._should_measure_adaptive_pp_critical_path(
+                changed_regime
             )
         )
 

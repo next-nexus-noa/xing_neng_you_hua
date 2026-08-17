@@ -467,6 +467,22 @@ def test_adaptive_ubatch_queue_safety_cli_args():
             "0.95",
             "--adaptive-ubatch-context-change-threshold",
             "0.25",
+            "--adaptive-ubatch-online-residual-limit-pct",
+            "6.0",
+            "--adaptive-ubatch-validation-required-observations",
+            "3",
+            "--adaptive-ubatch-validation-confidence-kappa",
+            "1.5",
+            "--adaptive-ubatch-validation-min-target-share",
+            "0.6",
+            "--adaptive-ubatch-exposure-stages",
+            "0.05,0.2,0.5",
+            "--adaptive-ubatch-exposure-validation-observations",
+            "5",
+            "--adaptive-ubatch-exposure-promotion-gain-pct",
+            "2.5",
+            "--adaptive-ubatch-exposure-queue-positive-ratio",
+            "0.7",
         ]
     )
     engine_args = EngineArgs.from_cli_args(args=args)
@@ -477,6 +493,14 @@ def test_adaptive_ubatch_queue_safety_cli_args():
     assert engine_args.adaptive_ubatch_context_min_observations == 4
     assert engine_args.adaptive_ubatch_context_forgetting_factor == 0.95
     assert engine_args.adaptive_ubatch_context_change_threshold == 0.25
+    assert engine_args.adaptive_ubatch_online_residual_limit_pct == 6.0
+    assert engine_args.adaptive_ubatch_validation_required_observations == 3
+    assert engine_args.adaptive_ubatch_validation_confidence_kappa == 1.5
+    assert engine_args.adaptive_ubatch_validation_min_target_share == 0.6
+    assert engine_args.adaptive_ubatch_exposure_stages == "0.05,0.2,0.5"
+    assert engine_args.adaptive_ubatch_exposure_validation_observations == 5
+    assert engine_args.adaptive_ubatch_exposure_promotion_gain_pct == 2.5
+    assert engine_args.adaptive_ubatch_exposure_queue_positive_ratio == 0.7
 
     args = parser.parse_args(["--no-adaptive-ubatch-queue-safety-enabled"])
     engine_args = EngineArgs.from_cli_args(args=args)

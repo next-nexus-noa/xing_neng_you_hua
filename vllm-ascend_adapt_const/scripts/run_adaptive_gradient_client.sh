@@ -15,6 +15,7 @@ SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-900}"
 TOP_SLOW="${TOP_SLOW:-10}"
 SKIP_STEPS="${SKIP_STEPS:-5}"
 WARMUP_RUNS="${WARMUP_RUNS:-1}"
+WARMUP_SEED_OFFSET="${WARMUP_SEED_OFFSET:-10000}"
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 CAPACITY_FILE="${CAPACITY_FILE:-$RESULT_ROOT/capacity_qps.csv}"
 LOW_QPS_FACTOR="${LOW_QPS_FACTOR:-0.35}"
@@ -443,6 +444,8 @@ tail -n +2 "$PLAN" | while IFS=, read -r run_id scenario_id dataset scenario mod
     echo "request_rate_spec=$request_rate_spec"
     echo "burstiness=$burstiness"
     echo "seed=$seed"
+    echo "formal_seed=$seed"
+    echo "warmup_seed_offset=$WARMUP_SEED_OFFSET"
     echo "num_prompts=$num_prompts"
     echo "micro_batch=$micro_batch"
     echo "dataset_name=$dataset_name"
@@ -463,9 +466,11 @@ tail -n +2 "$PLAN" | while IFS=, read -r run_id scenario_id dataset scenario mod
 
   if (( WARMUP_RUNS > 0 )); then
     for warmup_idx in $(seq 1 "$WARMUP_RUNS"); do
-      echo "[$adaptive_id] Running warmup benchmark $warmup_idx/$WARMUP_RUNS."
+      warmup_seed=$((seed + WARMUP_SEED_OFFSET + warmup_idx - 1))
+      echo "[$adaptive_id] Running warmup benchmark $warmup_idx/$WARMUP_RUNS with seed $warmup_seed."
       set +e
-      run_benchmark_once "$model" "$request_rate" "$burstiness" "$seed" \
+      run_benchmark_once "$model" "$request_rate" "$burstiness" \
+        "$warmup_seed" \
         "$num_prompts" "$host" "$port" "$dataset_name" "$dataset_path" \
         "$dataset_extra_args" "$run_dir/warmup_${warmup_idx}.txt"
       warmup_status="$?"

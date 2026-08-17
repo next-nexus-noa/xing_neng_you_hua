@@ -882,6 +882,35 @@ class Scheduler(SchedulerInterface):
                 )
 
         # Construct the scheduler output.
+        adaptive_output_tokens = 0
+        adaptive_max_waiting_age_ms = 0.0
+        if bool(
+            getattr(
+                self.vllm_config.parallel_config,
+                "enable_adaptive_ubatch",
+                False,
+            )
+        ):
+            for req_id, scheduled_tokens in num_scheduled_tokens.items():
+                request = self.requests[req_id]
+                start = int(request.num_computed_tokens)
+                end = start + int(scheduled_tokens)
+                # Computing the final prompt token produces the first output;
+                # subsequent decode/speculative tokens advance output service.
+                output_start = max(0, int(request.num_prompt_tokens) - 1)
+                adaptive_output_tokens += max(
+                    0,
+                    end - max(start, output_start),
+                )
+            now = time.time()
+            waiting_requests = [*self.waiting, *self.skipped_waiting]
+            adaptive_max_waiting_age_ms = max(
+                (
+                    max(0.0, now - float(request.arrival_time)) * 1000.0
+                    for request in waiting_requests
+                ),
+                default=0.0,
+            )
         if self.use_v2_model_runner:
             scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
             scheduled_resumed_reqs = []
@@ -944,6 +973,9 @@ class Scheduler(SchedulerInterface):
             adaptive_waiting_reqs=(
                 len(self.waiting) + len(self.skipped_waiting)
             ),
+            adaptive_output_tokens=adaptive_output_tokens,
+            adaptive_completed_reqs=len(self.finished_req_ids),
+            adaptive_max_waiting_age_ms=adaptive_max_waiting_age_ms,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

@@ -67,5 +67,5 @@ adaptive_ubatch_context_min_observations=3
 adaptive_ubatch_context_forgetting_factor=0.98
 adaptive_ubatch_context_change_threshold=0.12
 adaptive_decision_trace_enabled=1
-adaptive_ubatch_trace_path=gradient_results_adaptive_new/0005_E07_GovReport-GAO-2K_medium_poisson_14B_qps-auto-medium_burst-1_seed-0_mb-adaptive/adaptive_ubatch_decisions.jsonl
+adaptive_ubatch_trace_path=gradient_results_adaptive_new//0005_E07_GovReport-GAO-2K_medium_poisson_14B_qps-auto-medium_burst-1_seed-0_mb-adaptive/adaptive_ubatch_decisions.jsonl
 extra_server_args=--no-enable-prefix-caching

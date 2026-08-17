@@ -247,7 +247,7 @@ class ParallelConfig:
     """Multiplier for uncertainty in risk-aware robust cost."""
     adaptive_ubatch_max_uncertainty_ratio: float = 0.15
     """Reject non-current candidates above this uncertainty/calibrated-cost ratio."""
-    adaptive_ubatch_cold_start_penalty_ratio: float = 0.15
+    adaptive_ubatch_cold_start_penalty_ratio: float = 0.25
     """Relative uncertainty penalty while a bucket/M has few observations."""
     adaptive_ubatch_max_correction_ratio: float = 0.3
     """Maximum per-observation innovation used by contextual calibration."""
@@ -283,6 +283,26 @@ class ParallelConfig:
     """Recursive least-squares forgetting factor for dynamic workloads."""
     adaptive_ubatch_context_change_threshold: float = 0.12
     """Normalized context distance that starts a safe relearning period."""
+    adaptive_ubatch_online_residual_limit_pct: float = 8.0
+    """Maximum paired online correction around the frozen offline prior."""
+    adaptive_ubatch_validation_stage_steps: str = "4,8,16,32"
+    """Candidate steps in successive contiguous A/B/A validation stages."""
+    adaptive_ubatch_validation_safe_steps: int = 8
+    """Minimum M=1 steps in each bracketing counterfactual window."""
+    adaptive_ubatch_validation_min_output_tokens: int = 8
+    """Minimum served output tokens needed for a valid service-rate window."""
+    adaptive_ubatch_validation_gain_pct: float = 2.0
+    """Service-rate gain required to promote a validation lease."""
+    adaptive_ubatch_validation_required_observations: int = 2
+    """Independent matched A/B/A results required before promotion."""
+    adaptive_ubatch_validation_confidence_kappa: float = 1.0
+    """Standard-error multiplier for aggregate validation promotion."""
+    adaptive_ubatch_validation_min_target_share: float = 0.5
+    """Minimum target-bucket share required to start a candidate window."""
+    adaptive_ubatch_validation_washout_steps: int = 1
+    """Target-bucket steps excluded after changing the validation policy."""
+    adaptive_ubatch_queue_age_growth_threshold_ms: float = 10.0
+    """Extra waiting-age growth allowed versus the bracketing M=1 windows."""
     adaptive_ubatch_trace_path: str | None = None
     """Optional JSONL path for adaptive M decision and observation logs."""
 
@@ -596,6 +616,58 @@ class ParallelConfig:
         if self.adaptive_ubatch_context_change_threshold <= 0:
             raise ValueError(
                 "adaptive_ubatch_context_change_threshold must be > 0."
+            )
+        if self.adaptive_ubatch_online_residual_limit_pct < 0:
+            raise ValueError(
+                "adaptive_ubatch_online_residual_limit_pct must be >= 0."
+            )
+        try:
+            validation_steps = [
+                int(value.strip())
+                for value in self.adaptive_ubatch_validation_stage_steps.split(",")
+                if value.strip()
+            ]
+        except ValueError as exc:
+            raise ValueError(
+                "adaptive_ubatch_validation_stage_steps must contain "
+                "comma-separated positive integers."
+            ) from exc
+        if (
+            not validation_steps
+            or any(value < 1 for value in validation_steps)
+            or validation_steps != sorted(set(validation_steps))
+        ):
+            raise ValueError(
+                "adaptive_ubatch_validation_stage_steps must be strictly "
+                "increasing positive integers."
+            )
+        if self.adaptive_ubatch_validation_safe_steps < 1:
+            raise ValueError("adaptive_ubatch_validation_safe_steps must be >= 1.")
+        if self.adaptive_ubatch_validation_min_output_tokens < 1:
+            raise ValueError(
+                "adaptive_ubatch_validation_min_output_tokens must be >= 1."
+            )
+        if self.adaptive_ubatch_validation_gain_pct < 0:
+            raise ValueError("adaptive_ubatch_validation_gain_pct must be >= 0.")
+        if self.adaptive_ubatch_validation_required_observations < 2:
+            raise ValueError(
+                "adaptive_ubatch_validation_required_observations must be >= 2."
+            )
+        if self.adaptive_ubatch_validation_confidence_kappa < 0:
+            raise ValueError(
+                "adaptive_ubatch_validation_confidence_kappa must be >= 0."
+            )
+        if not 0 <= self.adaptive_ubatch_validation_min_target_share <= 1:
+            raise ValueError(
+                "adaptive_ubatch_validation_min_target_share must be in [0, 1]."
+            )
+        if self.adaptive_ubatch_validation_washout_steps < 0:
+            raise ValueError(
+                "adaptive_ubatch_validation_washout_steps must be >= 0."
+            )
+        if self.adaptive_ubatch_queue_age_growth_threshold_ms < 0:
+            raise ValueError(
+                "adaptive_ubatch_queue_age_growth_threshold_ms must be >= 0."
             )
         if self.adaptive_ubatch_min_tokens_m2 < 1:
             raise ValueError("adaptive_ubatch_min_tokens_m2 must be >= 1.")

@@ -242,6 +242,9 @@ class SchedulerOutput:
     # Defaults preserve compatibility with tests and external constructors.
     adaptive_queue_depth: int = 0
     adaptive_waiting_reqs: int = 0
+    adaptive_output_tokens: int = 0
+    adaptive_completed_reqs: int = 0
+    adaptive_max_waiting_age_ms: float = 0.0
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

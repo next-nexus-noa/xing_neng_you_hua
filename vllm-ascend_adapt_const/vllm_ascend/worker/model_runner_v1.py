@@ -539,6 +539,24 @@ class NPUModelRunner(GPUModelRunner):
         self._pending_adaptive_pp_elapsed_ms: float | None = None
         self._pending_adaptive_pp_npu_events: tuple[Any, Any] | None = None
         self._pending_adaptive_pp_send_wait_ms = 0.0
+        self._pending_adaptive_pp_validation_window = False
+        self._pending_adaptive_pp_output_tokens = 0
+        self._pending_adaptive_pp_completed_reqs = 0
+        self._pending_adaptive_pp_queue_growth = 0.0
+        self._pending_adaptive_pp_age_growth_ms = 0.0
+        self._pending_adaptive_pp_scheduler_steps = 0
+        self._pending_adaptive_pp_target_steps = 0
+        self._adaptive_validation_elapsed_ms = 0.0
+        self._adaptive_validation_output_tokens = 0
+        self._adaptive_validation_completed_reqs = 0
+        self._adaptive_validation_start_queue: int | None = None
+        self._adaptive_validation_start_age_ms: float | None = None
+        self._adaptive_validation_max_queue: int | None = None
+        self._adaptive_validation_max_age_ms: float | None = None
+        self._adaptive_validation_scheduler_steps = 0
+        self._adaptive_validation_target_steps = 0
+        self._adaptive_validation_window_id = -1
+        self._adaptive_validation_phase: str | None = None
         self._active_adaptive_pp_npu_start_event: Any | None = None
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
@@ -1961,6 +1979,9 @@ class NPUModelRunner(GPUModelRunner):
         *,
         queue_depth: int | None = None,
         waiting_reqs: int | None = None,
+        service_output_tokens: int = 0,
+        service_completed_reqs: int = 0,
+        max_waiting_age_ms: float = 0.0,
     ) -> AdaptiveUBatchDecision:
         if self.adaptive_ubatch_controller is None:
             self.adaptive_ubatch_controller = AdaptiveUBatchController(
@@ -1972,6 +1993,9 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens_np,
             queue_depth=queue_depth,
             waiting_reqs=waiting_reqs,
+            service_output_tokens=service_output_tokens,
+            service_completed_reqs=service_completed_reqs,
+            max_waiting_age_ms=max_waiting_age_ms,
         )
         max_count = self._pp_microbatch_configured_count()
         num_ubatches = max(1, min(decision.num_ubatches, max_count))
@@ -2030,6 +2054,16 @@ class NPUModelRunner(GPUModelRunner):
             contextual_baseline_ms=decision.contextual_baseline_ms,
             contextual_gain_lcb_pct=decision.contextual_gain_lcb_pct,
             contextual_regret_pct=decision.contextual_regret_pct,
+            service_output_tokens=decision.service_output_tokens,
+            service_completed_reqs=decision.service_completed_reqs,
+            max_waiting_age_ms=decision.max_waiting_age_ms,
+            validation_window_id=decision.validation_window_id,
+            validation_phase=decision.validation_phase,
+            validation_boundary=decision.validation_boundary,
+            validation_target_bucket=decision.validation_target_bucket,
+            validation_target_step=decision.validation_target_step,
+            validation_stage=decision.validation_stage,
+            validation_experiment_id=decision.validation_experiment_id,
         )
 
     def _use_mirrored_adaptive_pp_microbatch_decision(
@@ -2090,14 +2124,37 @@ class NPUModelRunner(GPUModelRunner):
                 group=pp.cpu_group,
             )
             elapsed_ms = float(elapsed.item())
-        self._observe_adaptive_pp_microbatch_result(
-            decision,
-            forward_ms=elapsed_ms,
-        )
+        if self._pending_adaptive_pp_validation_window:
+            self.adaptive_ubatch_controller.observe_service_window(
+                decision,
+                elapsed_ms=elapsed_ms,
+                output_tokens=self._pending_adaptive_pp_output_tokens,
+                completed_reqs=self._pending_adaptive_pp_completed_reqs,
+                queue_growth=self._pending_adaptive_pp_queue_growth,
+                waiting_age_growth_ms=(
+                    self._pending_adaptive_pp_age_growth_ms
+                ),
+                scheduler_steps=(
+                    self._pending_adaptive_pp_scheduler_steps
+                ),
+                target_steps=self._pending_adaptive_pp_target_steps,
+            )
+        else:
+            self._observe_adaptive_pp_microbatch_result(
+                decision,
+                forward_ms=elapsed_ms,
+            )
         self._pending_adaptive_pp_decision = None
         self._pending_adaptive_pp_elapsed_ms = None
         self._pending_adaptive_pp_npu_events = None
         self._pending_adaptive_pp_send_wait_ms = 0.0
+        self._pending_adaptive_pp_validation_window = False
+        self._pending_adaptive_pp_output_tokens = 0
+        self._pending_adaptive_pp_completed_reqs = 0
+        self._pending_adaptive_pp_queue_growth = 0.0
+        self._pending_adaptive_pp_age_growth_ms = 0.0
+        self._pending_adaptive_pp_scheduler_steps = 0
+        self._pending_adaptive_pp_target_steps = 0
         self._active_adaptive_pp_decision = None
         self._active_adaptive_pp_step_start = None
         self._active_adaptive_pp_npu_start_event = None
@@ -2160,6 +2217,10 @@ class NPUModelRunner(GPUModelRunner):
         # PP all-reduce in the fixed-M control-path ablation.
         if self._pp_microbatch_configured_count() <= 1:
             return False
+        if decision.validation_phase is not None:
+            # A validation window is accumulated locally and synchronized
+            # once at its boundary by _finish_adaptive_pp_step_measurement.
+            return False
         candidate_scores = getattr(decision, "candidate_scores", ())
         if candidate_scores and len(candidate_scores) <= 1:
             return False
@@ -2174,14 +2235,100 @@ class NPUModelRunner(GPUModelRunner):
                 )
             ),
         )
+        # During contextual cold start, sample the safe baseline more often.
+        # Candidate trials force their own measurement, so their sample count
+        # must not keep an otherwise stable M=1 path synchronizing forever.
+        if str(
+            getattr(
+                self.parallel_config,
+                "adaptive_ubatch_mode",
+                "",
+            )
+        ) == "contextual_safe":
+            min_context_observations = max(
+                1,
+                int(
+                    getattr(
+                        self.parallel_config,
+                        "adaptive_ubatch_context_min_observations",
+                        3,
+                    )
+                ),
+            )
+            safe_m = max(
+                1,
+                int(
+                    getattr(
+                        self.parallel_config,
+                        "adaptive_ubatch_safe_m",
+                        1,
+                    )
+                ),
+            )
+            safe_score = next(
+                (
+                    score
+                    for score in candidate_scores
+                    if int(score.get("m", -1)) == safe_m
+                ),
+                None,
+            )
+            safe_context_count = (
+                int(safe_score.get("contextual_count", 0) or 0)
+                if safe_score is not None
+                else 0
+            )
+            # M=1 timing requires a cross-stage reduction, so do not try to
+            # fill one sample per feature dimension on the live path. The
+            # recursive model remains deliberately uncertain with sparse
+            # evidence; bounded candidate exposure provides the safety layer.
+            safe_context_target = min_context_observations
+            reason = str(getattr(decision, "reason", ""))
+            if reason == "contextual_regime_warmup":
+                interval = min(
+                    interval,
+                    max(
+                        1,
+                        int(
+                            getattr(
+                                self.parallel_config,
+                                "adaptive_ubatch_exploration_stable_steps",
+                                8,
+                            )
+                        ),
+                    ),
+                )
+            elif safe_context_count < safe_context_target:
+                # Reserve one share of the normal interval for moving from
+                # safe-arm calibration into candidate exploration. This is
+                # derived from the requested evidence count rather than a
+                # workload- or model-specific tuning constant.
+                interval = min(
+                    interval,
+                    max(
+                        1,
+                        interval // (safe_context_target + 1),
+                    ),
+                )
+            # Once calibrated, retain the configured low-rate periodic sample
+            # instead of disabling safe feedback completely. This lets the
+            # M=1 counterfactual follow QPS and request-shape drift.
+        contextual_mode = str(
+            getattr(self.parallel_config, "adaptive_ubatch_mode", "")
+        ) == "contextual_safe"
         return (
             self._adaptive_pp_feedback_step % interval == 0
-            or decision.switched
+            or (decision.switched and not contextual_mode)
             or decision.reason
             in {
                 "candidate_calibration",
                 "controlled_exploration",
                 "contextual_exploration",
+                "contextual_probe_lease",
+                "contextual_probe_pre_anchor",
+                "contextual_probe_post_anchor",
+                "contextual_probe_context_guard",
+                "contextual_exposure_validation",
             }
         )
 
@@ -2191,11 +2338,25 @@ class NPUModelRunner(GPUModelRunner):
         *,
         elapsed_ms: float,
         npu_events: tuple[Any, Any] | None = None,
+        validation_window: bool = False,
+        output_tokens: int = 0,
+        completed_reqs: int = 0,
+        queue_growth: float = 0.0,
+        waiting_age_growth_ms: float = 0.0,
+        scheduler_steps: int = 0,
+        target_steps: int = 0,
     ) -> None:
         self._pending_adaptive_pp_decision = decision
         self._pending_adaptive_pp_elapsed_ms = elapsed_ms
         self._pending_adaptive_pp_npu_events = npu_events
         self._pending_adaptive_pp_send_wait_ms = 0.0
+        self._pending_adaptive_pp_validation_window = validation_window
+        self._pending_adaptive_pp_output_tokens = output_tokens
+        self._pending_adaptive_pp_completed_reqs = completed_reqs
+        self._pending_adaptive_pp_queue_growth = queue_growth
+        self._pending_adaptive_pp_age_growth_ms = waiting_age_growth_ms
+        self._pending_adaptive_pp_scheduler_steps = scheduler_steps
+        self._pending_adaptive_pp_target_steps = target_steps
 
     def _add_pending_adaptive_pp_send_wait(self, elapsed_ms: float) -> None:
         """Attribute deferred PP-send completion to the step that created it."""
@@ -2244,10 +2405,124 @@ class NPUModelRunner(GPUModelRunner):
         if decision is None or start is None:
             return
         if failure_reason is not None:
+            if decision.validation_phase is not None:
+                self._adaptive_validation_elapsed_ms = 0.0
+                self._adaptive_validation_output_tokens = 0
+                self._adaptive_validation_completed_reqs = 0
+                self._adaptive_validation_start_queue = None
+                self._adaptive_validation_start_age_ms = None
+                self._adaptive_validation_max_queue = None
+                self._adaptive_validation_max_age_ms = None
+                self._adaptive_validation_scheduler_steps = 0
+                self._adaptive_validation_target_steps = 0
+                self._adaptive_validation_window_id = -1
+                self._adaptive_validation_phase = None
             self._observe_adaptive_pp_microbatch_failure(
                 decision,
                 reason=failure_reason,
             )
+            return
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if decision.validation_phase is not None:
+            if self._adaptive_validation_start_queue is None:
+                self._adaptive_validation_start_queue = (
+                    decision.queue_depth
+                )
+                self._adaptive_validation_start_age_ms = (
+                    decision.max_waiting_age_ms
+                )
+                self._adaptive_validation_max_queue = decision.queue_depth
+                self._adaptive_validation_max_age_ms = (
+                    decision.max_waiting_age_ms
+                )
+            if decision.queue_depth is not None:
+                prior_max_queue = getattr(
+                    self,
+                    "_adaptive_validation_max_queue",
+                    None,
+                )
+                self._adaptive_validation_max_queue = max(
+                    decision.queue_depth,
+                    prior_max_queue
+                    if prior_max_queue is not None
+                    else decision.queue_depth,
+                )
+            prior_max_age = getattr(
+                self,
+                "_adaptive_validation_max_age_ms",
+                None,
+            )
+            self._adaptive_validation_max_age_ms = max(
+                decision.max_waiting_age_ms,
+                prior_max_age
+                if prior_max_age is not None
+                else decision.max_waiting_age_ms,
+            )
+            self._adaptive_validation_scheduler_steps = int(
+                getattr(
+                    self,
+                    "_adaptive_validation_scheduler_steps",
+                    0,
+                )
+            ) + 1
+            self._adaptive_validation_target_steps = int(
+                getattr(
+                    self,
+                    "_adaptive_validation_target_steps",
+                    0,
+                )
+            ) + int(
+                decision.validation_target_step,
+            )
+            self._adaptive_validation_elapsed_ms += elapsed_ms
+            self._adaptive_validation_output_tokens += (
+                decision.service_output_tokens
+            )
+            self._adaptive_validation_completed_reqs += (
+                decision.service_completed_reqs
+            )
+            if decision.validation_boundary:
+                start_queue = self._adaptive_validation_start_queue
+                start_age = self._adaptive_validation_start_age_ms
+                self._queue_adaptive_pp_microbatch_result(
+                    decision,
+                    elapsed_ms=self._adaptive_validation_elapsed_ms,
+                    validation_window=True,
+                    output_tokens=(
+                        self._adaptive_validation_output_tokens
+                    ),
+                    completed_reqs=(
+                        self._adaptive_validation_completed_reqs
+                    ),
+                    queue_growth=(
+                        float(
+                            self._adaptive_validation_max_queue
+                            - start_queue
+                        )
+                        if self._adaptive_validation_max_queue is not None
+                        and start_queue is not None
+                        else 0.0
+                    ),
+                    waiting_age_growth_ms=(
+                        self._adaptive_validation_max_age_ms - start_age
+                        if self._adaptive_validation_max_age_ms is not None
+                        and start_age is not None
+                        else 0.0
+                    ),
+                    scheduler_steps=(
+                        self._adaptive_validation_scheduler_steps
+                    ),
+                    target_steps=self._adaptive_validation_target_steps,
+                )
+                self._adaptive_validation_elapsed_ms = 0.0
+                self._adaptive_validation_output_tokens = 0
+                self._adaptive_validation_completed_reqs = 0
+                self._adaptive_validation_start_queue = None
+                self._adaptive_validation_start_age_ms = None
+                self._adaptive_validation_max_queue = None
+                self._adaptive_validation_max_age_ms = None
+                self._adaptive_validation_scheduler_steps = 0
+                self._adaptive_validation_target_steps = 0
             return
         npu_events = None
         if npu_start_event is not None:
@@ -2263,7 +2538,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
         self._queue_adaptive_pp_microbatch_result(
             decision,
-            elapsed_ms=(time.perf_counter() - start) * 1000.0,
+            elapsed_ms=elapsed_ms,
             npu_events=npu_events,
         )
 
@@ -2729,6 +3004,21 @@ class NPUModelRunner(GPUModelRunner):
                                     "adaptive_waiting_reqs",
                                     None,
                                 ),
+                                service_output_tokens=getattr(
+                                    scheduler_output,
+                                    "adaptive_output_tokens",
+                                    0,
+                                ),
+                                service_completed_reqs=getattr(
+                                    scheduler_output,
+                                    "adaptive_completed_reqs",
+                                    0,
+                                ),
+                                max_waiting_age_ms=getattr(
+                                    scheduler_output,
+                                    "adaptive_max_waiting_age_ms",
+                                    0.0,
+                                ),
                             )
                         )
                         adaptive_pp_decision = (
@@ -2783,27 +3073,68 @@ class NPUModelRunner(GPUModelRunner):
                         pp_microbatch_count = self._pp_microbatch_count(
                             num_tokens_unpadded, num_scheduled_tokens_np
                         )
-                if adaptive_pp_measure:
+                adaptive_validation_active = bool(
+                    adaptive_pp_decision is not None
+                    and adaptive_pp_decision.validation_phase is not None
+                )
+                if adaptive_validation_active:
+                    validation_key = (
+                        adaptive_pp_decision.validation_window_id,
+                        adaptive_pp_decision.validation_phase,
+                    )
+                    if validation_key != (
+                        self._adaptive_validation_window_id,
+                        self._adaptive_validation_phase,
+                    ):
+                        self._adaptive_validation_elapsed_ms = 0.0
+                        self._adaptive_validation_output_tokens = 0
+                        self._adaptive_validation_completed_reqs = 0
+                        self._adaptive_validation_start_queue = None
+                        self._adaptive_validation_start_age_ms = None
+                        self._adaptive_validation_max_queue = None
+                        self._adaptive_validation_max_age_ms = None
+                        self._adaptive_validation_scheduler_steps = 0
+                        self._adaptive_validation_target_steps = 0
+                        self._adaptive_validation_window_id = (
+                            adaptive_pp_decision.validation_window_id
+                        )
+                        self._adaptive_validation_phase = (
+                            adaptive_pp_decision.validation_phase
+                        )
+                else:
+                    self._adaptive_validation_elapsed_ms = 0.0
+                    self._adaptive_validation_output_tokens = 0
+                    self._adaptive_validation_completed_reqs = 0
+                    self._adaptive_validation_start_queue = None
+                    self._adaptive_validation_start_age_ms = None
+                    self._adaptive_validation_max_queue = None
+                    self._adaptive_validation_max_age_ms = None
+                    self._adaptive_validation_scheduler_steps = 0
+                    self._adaptive_validation_target_steps = 0
+                    self._adaptive_validation_window_id = -1
+                    self._adaptive_validation_phase = None
+                if adaptive_pp_measure or adaptive_validation_active:
                     adaptive_pp_step_start = time.perf_counter()
                     self._active_adaptive_pp_decision = adaptive_pp_decision
                     self._active_adaptive_pp_step_start = (
                         adaptive_pp_step_start
                     )
                     self._active_adaptive_pp_npu_start_event = None
-                    try:
-                        npu_start_event = torch.npu.Event(
-                            enable_timing=True
-                        )
-                        npu_start_event.record()
-                        self._active_adaptive_pp_npu_start_event = (
-                            npu_start_event
-                        )
-                    except (RuntimeError, TypeError):
-                        logger.debug(
-                            "Unable to record adaptive PP start event; "
-                            "using CPU full-step timing.",
-                            exc_info=True,
-                        )
+                    if not adaptive_validation_active:
+                        try:
+                            npu_start_event = torch.npu.Event(
+                                enable_timing=True
+                            )
+                            npu_start_event.record()
+                            self._active_adaptive_pp_npu_start_event = (
+                                npu_start_event
+                            )
+                        except (RuntimeError, TypeError):
+                            logger.debug(
+                                "Unable to record adaptive PP start event; "
+                                "using CPU full-step timing.",
+                                exc_info=True,
+                            )
                 pp_microbatch_active = pp_microbatch_enabled and pp_microbatch_count > 1
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
@@ -3236,7 +3567,10 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
-        adaptive_observe = adaptive_pp_measure and adaptive_pp_decision is not None
+        adaptive_observe = (
+            (adaptive_pp_measure or adaptive_validation_active)
+            and adaptive_pp_decision is not None
+        )
         try:
             with self.maybe_get_kv_connector_output(
                 scheduler_output,

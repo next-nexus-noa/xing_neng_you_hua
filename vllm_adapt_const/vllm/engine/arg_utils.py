@@ -563,6 +563,36 @@ class EngineArgs:
     adaptive_ubatch_context_change_threshold: float = (
         ParallelConfig.adaptive_ubatch_context_change_threshold
     )
+    adaptive_ubatch_online_residual_limit_pct: float = (
+        ParallelConfig.adaptive_ubatch_online_residual_limit_pct
+    )
+    adaptive_ubatch_validation_stage_steps: str = (
+        ParallelConfig.adaptive_ubatch_validation_stage_steps
+    )
+    adaptive_ubatch_validation_safe_steps: int = (
+        ParallelConfig.adaptive_ubatch_validation_safe_steps
+    )
+    adaptive_ubatch_validation_min_output_tokens: int = (
+        ParallelConfig.adaptive_ubatch_validation_min_output_tokens
+    )
+    adaptive_ubatch_validation_gain_pct: float = (
+        ParallelConfig.adaptive_ubatch_validation_gain_pct
+    )
+    adaptive_ubatch_validation_required_observations: int = (
+        ParallelConfig.adaptive_ubatch_validation_required_observations
+    )
+    adaptive_ubatch_validation_confidence_kappa: float = (
+        ParallelConfig.adaptive_ubatch_validation_confidence_kappa
+    )
+    adaptive_ubatch_validation_min_target_share: float = (
+        ParallelConfig.adaptive_ubatch_validation_min_target_share
+    )
+    adaptive_ubatch_validation_washout_steps: int = (
+        ParallelConfig.adaptive_ubatch_validation_washout_steps
+    )
+    adaptive_ubatch_queue_age_growth_threshold_ms: float = (
+        ParallelConfig.adaptive_ubatch_queue_age_growth_threshold_ms
+    )
     adaptive_ubatch_trace_path: str | None = ParallelConfig.adaptive_ubatch_trace_path
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
     dbo_prefill_token_threshold: int = ParallelConfig.dbo_prefill_token_threshold
@@ -1265,6 +1295,54 @@ class EngineArgs:
         parallel_group.add_argument(
             "--adaptive-ubatch-context-change-threshold",
             **parallel_kwargs["adaptive_ubatch_context_change_threshold"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-online-residual-limit-pct",
+            **parallel_kwargs["adaptive_ubatch_online_residual_limit_pct"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-validation-stage-steps",
+            **parallel_kwargs["adaptive_ubatch_validation_stage_steps"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-validation-safe-steps",
+            **parallel_kwargs["adaptive_ubatch_validation_safe_steps"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-validation-min-output-tokens",
+            **parallel_kwargs["adaptive_ubatch_validation_min_output_tokens"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-validation-gain-pct",
+            **parallel_kwargs["adaptive_ubatch_validation_gain_pct"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-validation-required-observations",
+            **parallel_kwargs[
+                "adaptive_ubatch_validation_required_observations"
+            ],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-validation-confidence-kappa",
+            **parallel_kwargs[
+                "adaptive_ubatch_validation_confidence_kappa"
+            ],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-validation-min-target-share",
+            **parallel_kwargs[
+                "adaptive_ubatch_validation_min_target_share"
+            ],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-validation-washout-steps",
+            **parallel_kwargs["adaptive_ubatch_validation_washout_steps"],
+        )
+        parallel_group.add_argument(
+            "--adaptive-ubatch-queue-age-growth-threshold-ms",
+            **parallel_kwargs[
+                "adaptive_ubatch_queue_age_growth_threshold_ms"
+            ],
         )
         parallel_group.add_argument(
             "--adaptive-ubatch-trace-path",
@@ -2221,6 +2299,36 @@ class EngineArgs:
             ),
             adaptive_ubatch_context_change_threshold=(
                 self.adaptive_ubatch_context_change_threshold
+            ),
+            adaptive_ubatch_online_residual_limit_pct=(
+                self.adaptive_ubatch_online_residual_limit_pct
+            ),
+            adaptive_ubatch_validation_stage_steps=(
+                self.adaptive_ubatch_validation_stage_steps
+            ),
+            adaptive_ubatch_validation_safe_steps=(
+                self.adaptive_ubatch_validation_safe_steps
+            ),
+            adaptive_ubatch_validation_min_output_tokens=(
+                self.adaptive_ubatch_validation_min_output_tokens
+            ),
+            adaptive_ubatch_validation_gain_pct=(
+                self.adaptive_ubatch_validation_gain_pct
+            ),
+            adaptive_ubatch_validation_required_observations=(
+                self.adaptive_ubatch_validation_required_observations
+            ),
+            adaptive_ubatch_validation_confidence_kappa=(
+                self.adaptive_ubatch_validation_confidence_kappa
+            ),
+            adaptive_ubatch_validation_min_target_share=(
+                self.adaptive_ubatch_validation_min_target_share
+            ),
+            adaptive_ubatch_validation_washout_steps=(
+                self.adaptive_ubatch_validation_washout_steps
+            ),
+            adaptive_ubatch_queue_age_growth_threshold_ms=(
+                self.adaptive_ubatch_queue_age_growth_threshold_ms
             ),
             adaptive_ubatch_trace_path=self.adaptive_ubatch_trace_path,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,

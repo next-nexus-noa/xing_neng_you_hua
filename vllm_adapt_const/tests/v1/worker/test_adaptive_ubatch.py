@@ -11,6 +11,7 @@ from vllm.v1.worker.adaptive_ubatch import (
     AdaptiveUBatchController,
     AdaptiveUBatchDecision,
     CandidateScore,
+    ContextualValidationState,
     PendingContextualOutcome,
     WorkloadBucket,
     extract_adaptive_ubatch_features,
@@ -71,6 +72,25 @@ def _model_config(model_billions: int):
 
 def _candidate(decision, m: int):
     return next(score for score in decision.candidate_scores if score["m"] == m)
+
+
+def _validation_boundary_decision(state):
+    return AdaptiveUBatchDecision(
+        num_ubatches=(
+            state.candidate_m if state.phase == "candidate" else 1
+        ),
+        predicted_gain_pct=0.0,
+        reason=f"test_{state.phase}",
+        bucket_key=state.target_bucket,
+        total_tokens=2048,
+        validation_window_id=state.window_id,
+        validation_phase=state.phase,
+        validation_boundary=True,
+        validation_target_bucket=state.target_bucket,
+        validation_target_step=True,
+        validation_stage=state.stage,
+        validation_experiment_id=state.experiment_id,
+    )
 
 
 @pytest.mark.parametrize(
@@ -366,7 +386,7 @@ def test_calibration_does_not_leak_between_workload_buckets():
     assert _candidate(prefill, 1)["calibration_scale"] == pytest.approx(1.0)
 
 
-def test_candidate_calibration_balances_coverage_and_ignores_cold_samples(
+def test_candidate_calibration_balances_coverage_and_marks_transition_samples(
     tmp_path,
 ):
     trace_path = tmp_path / "adaptive.jsonl"
@@ -386,8 +406,8 @@ def test_candidate_calibration_balances_coverage_and_ignores_cold_samples(
         prior_ms = _candidate(decision, decision.num_ubatches)["prior_ms"]
         controller.observe(decision, forward_ms=prior_ms)
 
-    # Each M gets one ignored compilation-prone sample followed by two
-    # accepted calibration samples before score-based selection starts.
+    # Each M gets one transition-only sample followed by two accepted
+    # steady-state samples before score-based selection starts.
     calibration = [d for d in decisions if d.reason == "candidate_calibration"]
     assert [d.num_ubatches for d in calibration] == [
         1, 1, 1,
@@ -404,12 +424,12 @@ def test_candidate_calibration_balances_coverage_and_ignores_cold_samples(
         json.loads(line)
         for line in trace_path.read_text(encoding="utf-8").splitlines()
     ]
-    ignored = [
+    transitions = [
         record
         for record in records
-        if record["type"] == "adaptive_ubatch_cold_sample_ignored"
+        if record["type"] == "adaptive_ubatch_transition_sample"
     ]
-    assert [record["selected_m"] for record in ignored] == [1, 2, 4]
+    assert [record["selected_m"] for record in transitions] == [1, 2, 4]
 
 
 def test_prefill_shapes_share_one_bounded_calibration_budget():
@@ -537,12 +557,252 @@ def _contextual_controller(**overrides):
     )
 
 
+def _commit_validation_phase(
+    controller,
+    state,
+    *,
+    scheduler_steps,
+    target_steps,
+    output_tokens,
+):
+    controller._record_validation_context(
+        state,
+        (1.0,) + (0.0,) * 11,
+    )
+    controller.observe_service_window(
+        _validation_boundary_decision(state),
+        elapsed_ms=1000.0,
+        output_tokens=output_tokens,
+        completed_reqs=0,
+        scheduler_steps=scheduler_steps,
+        target_steps=target_steps,
+    )
+
+
+def test_contextual_validation_rejects_background_mismatched_label():
+    controller = _contextual_controller()
+    state = ContextualValidationState(
+        generation=0,
+        target_bucket=("medium", "prefill", "large"),
+        candidate_m=2,
+        phase="safe_before",
+        window_id=1,
+        experiment_id=1,
+    )
+    controller._active_validation = state
+
+    _commit_validation_phase(
+        controller,
+        state,
+        scheduler_steps=8,
+        target_steps=8,
+        output_tokens=100,
+    )
+    _commit_validation_phase(
+        controller,
+        state,
+        scheduler_steps=40,
+        target_steps=4,
+        output_tokens=120,
+    )
+    _commit_validation_phase(
+        controller,
+        state,
+        scheduler_steps=8,
+        target_steps=8,
+        output_tokens=100,
+    )
+
+    assert controller._contextual_state(2).count == 0
+    assert controller._active_validation.phase == "idle"
+
+
+def test_contextual_validation_requires_repeated_matched_labels():
+    controller = _contextual_controller()
+    state = ContextualValidationState(
+        generation=0,
+        target_bucket=("medium", "prefill", "large"),
+        candidate_m=2,
+        phase="safe_before",
+        window_id=1,
+        experiment_id=1,
+    )
+    controller._active_validation = state
+
+    _commit_validation_phase(
+        controller,
+        state,
+        scheduler_steps=8,
+        target_steps=8,
+        output_tokens=100,
+    )
+    _commit_validation_phase(
+        controller,
+        state,
+        scheduler_steps=4,
+        target_steps=4,
+        output_tokens=120,
+    )
+    _commit_validation_phase(
+        controller,
+        state,
+        scheduler_steps=8,
+        target_steps=8,
+        output_tokens=100,
+    )
+
+    assert controller._contextual_state(2).count == 0
+    assert controller._active_validation.phase == "candidate"
+    assert controller._active_validation.stage == 0
+
+    _commit_validation_phase(
+        controller,
+        state,
+        scheduler_steps=4,
+        target_steps=4,
+        output_tokens=120,
+    )
+    _commit_validation_phase(
+        controller,
+        state,
+        scheduler_steps=8,
+        target_steps=8,
+        output_tokens=100,
+    )
+
+    assert controller._contextual_state(2).count == 1
+    assert controller._active_validation.phase == "candidate"
+    assert controller._active_validation.stage == 1
+
+
+def test_contextual_validation_stops_on_severe_first_loss():
+    controller = _contextual_controller()
+    state = ContextualValidationState(
+        generation=0,
+        target_bucket=("medium", "prefill", "large"),
+        candidate_m=2,
+        phase="safe_before",
+        window_id=1,
+        experiment_id=1,
+    )
+    controller._active_validation = state
+
+    _commit_validation_phase(
+        controller,
+        state,
+        scheduler_steps=8,
+        target_steps=8,
+        output_tokens=100,
+    )
+    _commit_validation_phase(
+        controller,
+        state,
+        scheduler_steps=8,
+        target_steps=8,
+        output_tokens=80,
+    )
+    _commit_validation_phase(
+        controller,
+        state,
+        scheduler_steps=8,
+        target_steps=8,
+        output_tokens=100,
+    )
+
+    assert controller._contextual_state(2).count == 0
+    assert controller._active_validation.phase == "idle"
+
+
+def test_contextual_candidate_ignores_unpaired_full_worker_feedback():
+    controller = _contextual_controller(
+        adaptive_ubatch_online_residual_limit_pct=8.0,
+    )
+    state = controller._contextual_state(2)
+    offline_coefficients = state.offline_coefficients.copy()
+    context = (1.0,) + (0.0,) * 11
+    controller._pending_contextual_outcome = PendingContextualOutcome(
+        bucket_key=("medium", "prefill", "large"),
+        selected_m=2,
+        context=context,
+        prior_ms=100.0,
+        actual_ms=10.0,
+        baseline_ms=100.0,
+        queue_depth=1,
+        waiting_reqs=1,
+    )
+
+    controller._finalize_contextual_outcome(
+        queue_depth=1,
+        waiting_reqs=1,
+    )
+
+    assert state.count == 0
+    np.testing.assert_array_equal(
+        state.offline_coefficients,
+        offline_coefficients,
+    )
+
+
+def test_contextual_paired_residual_is_bounded_around_offline_prior():
+    controller = _contextual_controller(
+        adaptive_ubatch_online_residual_limit_pct=8.0,
+    )
+    state = controller._contextual_state(2)
+    context = np.asarray((1.0,) + (0.0,) * 11)
+
+    state.update(
+        context=context,
+        target=10.0,
+        forgetting_factor=1.0,
+        alpha=1.0,
+        step_id=1,
+    )
+    _, online_residual, _ = state.predict_components(context)
+
+    assert abs(online_residual) <= np.log1p(0.08)
+
+
 def _observe_contextual_step(controller, workload, *, candidate_scale):
     decision = controller.select(workload, queue_depth=4, waiting_reqs=4)
     selected = _candidate(decision, decision.num_ubatches)
     scale = candidate_scale if decision.num_ubatches > 1 else 1.0
     controller.observe(decision, forward_ms=selected["prior_ms"] * scale)
     return decision
+
+
+def _apply_contextual_after_safe_anchor(
+    controller,
+    *,
+    proposed,
+    safe_score,
+    candidate_scores,
+    bucket,
+    context,
+):
+    selected, reason, *_ = controller._apply_contextual_safety(
+        proposed=proposed,
+        safe_score=safe_score,
+        candidate_scores=candidate_scores,
+        bucket=bucket,
+        context=tuple(context),
+        regime_warmup=False,
+    )
+    assert selected.m == safe_score.m
+    assert reason == "contextual_probe_pre_anchor"
+    regime = controller._regime_state(bucket)
+    regime.safe_anchor_scale = 1.0
+    regime.safe_anchor_context = tuple(context)
+    regime.safe_anchor_step = controller._step_id + 1
+    regime.safe_anchor_generation = regime.generation
+    controller._step_id += 1
+    return controller._apply_contextual_safety(
+        proposed=proposed,
+        safe_score=safe_score,
+        candidate_scores=candidate_scores,
+        bucket=bucket,
+        context=tuple(context),
+        regime_warmup=False,
+    )
 
 
 def test_contextual_safe_learns_and_preserves_a_beneficial_candidate():
@@ -558,8 +818,12 @@ def test_contextual_safe_learns_and_preserves_a_beneficial_candidate():
     assert "contextual_exploration" in {d.reason for d in decisions}
     assert controller._contextual_state(1).count >= 1
     assert controller._contextual_state(2).count >= 1
-    assert final.num_ubatches == 2
-    assert final.reason == "contextual_proven_gain"
+    assert 2 in {decision.num_ubatches for decision in decisions}
+    assert final.reason in {
+        "contextual_exposure_guard",
+        "contextual_exposure_validation",
+        "contextual_bounded_gain",
+    }
     assert final.contextual_gain_lcb_pct > 0
     assert _candidate(final, 2)["contextual_relative_ratio"] < 1.0
 
@@ -621,10 +885,15 @@ def test_contextual_regime_change_resets_only_changed_bucket_stability():
         decode_bucket
     ).stable_observations
 
-    decision = controller.select(changed, queue_depth=12, waiting_reqs=10)
+    decisions = [
+        controller.select(changed, queue_depth=12, waiting_reqs=10)
+        for _ in range(4)
+    ]
 
-    assert decision.reason == "contextual_regime_warmup"
-    assert controller._regime_state(prefill_bucket).stable_observations == 0
+    assert "contextual_regime_warmup" in {
+        decision.reason for decision in decisions
+    }
+    assert controller._regime_state(prefill_bucket).generation >= 1
     assert (
         controller._regime_state(decode_bucket).stable_observations
         == decode_stability
@@ -639,47 +908,51 @@ def test_contextual_safe_can_choose_m2_when_base_policy_proposes_m4():
     m4 = CandidateScore(4, 70.0, 0.0, 70.0, 0.0, 70.0, 3)
     for _ in range(3):
         controller._contextual_state(1).update(
-            context=context,
+            context=np.append(context, 0.0),
             target=0.0,
             forgetting_factor=0.98,
             alpha=0.2,
             step_id=controller._step_id,
         )
         controller._contextual_state(2).update(
-            context=context,
+            context=np.append(context, np.log(0.8)),
             target=np.log(0.8),
             forgetting_factor=0.98,
             alpha=0.2,
             step_id=controller._step_id,
         )
         controller._contextual_state(4).update(
-            context=context,
+            context=np.append(context, np.log(0.7)),
             target=np.log(1.1),
             forgetting_factor=0.98,
             alpha=0.2,
             step_id=controller._step_id,
         )
 
+    bucket = WorkloadBucket("medium", "prefill", "large")
+    exposure = controller._exposure_state(bucket, 2)
+    exposure.stage = len(controller._exposure_ratios())
+    exposure.credit = 1.0
+    exposure.validated = True
     selected, reason, gain, _, _, evaluations = (
         controller._apply_contextual_safety(
             proposed=m4,
             safe_score=safe,
             candidate_scores=[safe, m2, m4],
-            bucket=WorkloadBucket("medium", "prefill", "large"),
+            bucket=bucket,
             context=tuple(context),
             regime_warmup=False,
         )
     )
 
     assert selected.m == 2
-    assert reason == "contextual_proven_gain"
+    assert reason == "contextual_bounded_gain"
     assert gain > 5.0
     assert evaluations[2]["contextual_relative_ratio"] < 1.0
     assert evaluations[4]["contextual_relative_ratio"] > 1.0
 
-    bucket = WorkloadBucket("medium", "prefill", "large")
     controller._regret_state(bucket).add(
-        regret_ms=3.0,
+        regret_ms=10.0,
         baseline_ms=100.0,
         window_steps=64,
     )
@@ -703,7 +976,7 @@ def test_contextual_safe_blocks_after_exceeding_regret_budget():
     prefill = np.array([1024, 1024], dtype=np.int32)
     bucket = WorkloadBucket.from_key(("medium", "prefill", "large"))
     controller._regret_state(bucket).add(
-        regret_ms=3.0,
+        regret_ms=1000.0,
         baseline_ms=100.0,
         window_steps=8,
     )
@@ -769,7 +1042,7 @@ def test_contextual_outlier_is_clipped_and_only_temporarily_cools_arm():
         np.asarray(context)
     )
     assert predicted_log_ratio <= np.log(1.3)
-    assert controller._regret_state(bucket).regret_pct() == pytest.approx(5.0)
+    assert controller._regret_state(bucket).regret_pct() == pytest.approx(200.0)
     assert controller._cooldown_until[(bucket.as_tuple(), 2)] == 8
     assert (bucket.as_tuple(), 4) not in controller._cooldown_until
 
@@ -789,7 +1062,7 @@ def test_contextual_outlier_is_clipped_and_only_temporarily_cools_arm():
             waiting_reqs=4,
         )
 
-    assert controller._regret_state(bucket).regret_pct() < 2.0
+    assert controller._regret_state(bucket).regret_pct() > 2.0
 
 
 def test_contextual_cold_exploration_stages_m2_before_m4():
@@ -814,13 +1087,13 @@ def test_contextual_cold_exploration_stages_m2_before_m4():
     controller._regime_state(bucket).stable_observations = 1
     controller._step_id = 1
 
-    selected, reason, *_ = controller._apply_contextual_safety(
+    selected, reason, *_ = _apply_contextual_after_safe_anchor(
+        controller,
         proposed=m4,
         safe_score=safe,
         candidate_scores=[safe, m2, m4],
         bucket=bucket,
-        context=tuple(context),
-        regime_warmup=False,
+        context=context,
     )
 
     assert selected.m == 2
@@ -841,14 +1114,14 @@ def test_contextual_proven_m2_does_not_starve_cold_m4():
     m4 = CandidateScore(4, 70.0, 0.0, 70.0, 0.0, 70.0, 0)
     for _ in range(3):
         controller._contextual_state(1).update(
-            context=context,
+            context=np.append(context, 0.0),
             target=0.0,
             forgetting_factor=0.98,
             alpha=0.2,
             step_id=0,
         )
         controller._contextual_state(2).update(
-            context=context,
+            context=np.append(context, np.log(0.8)),
             target=np.log(0.8),
             forgetting_factor=0.98,
             alpha=0.2,
@@ -857,13 +1130,13 @@ def test_contextual_proven_m2_does_not_starve_cold_m4():
     controller._regime_state(bucket).stable_observations = 1
     controller._step_id = 1
 
-    selected, reason, *_ = controller._apply_contextual_safety(
+    selected, reason, *_ = _apply_contextual_after_safe_anchor(
+        controller,
         proposed=m2,
         safe_score=safe,
         candidate_scores=[safe, m2, m4],
         bucket=bucket,
-        context=tuple(context),
-        regime_warmup=False,
+        context=context,
     )
 
     assert selected.m == 4
@@ -880,10 +1153,15 @@ def test_contextual_safe_detects_a_dynamic_regime_change():
 
     for _ in range(10):
         _observe_contextual_step(controller, steady, candidate_scale=0.7)
-    decision = controller.select(changed, queue_depth=12, waiting_reqs=10)
+    decisions = [
+        controller.select(changed, queue_depth=12, waiting_reqs=10)
+        for _ in range(4)
+    ]
 
-    assert decision.num_ubatches == 1
-    assert decision.reason == "contextual_regime_warmup"
+    assert all(decision.num_ubatches == 1 for decision in decisions)
+    assert "contextual_regime_warmup" in {
+        decision.reason for decision in decisions
+    }
 
 
 def test_contextual_safe_requires_repeated_queue_regression():
@@ -936,3 +1214,523 @@ def test_contextual_decision_payload_round_trip():
     assert restored.contextual_baseline_ms == pytest.approx(12.5)
     assert restored.contextual_gain_lcb_pct == pytest.approx(4.0)
     assert restored.contextual_regret_pct == pytest.approx(1.25)
+
+
+def test_contextual_decision_reports_safe_arm_observation_count():
+    controller = _contextual_controller(
+        adaptive_ubatch_context_min_observations=3,
+    )
+    tokens = np.array([1024, 1024], dtype=np.int32)
+
+    decision = controller.select(
+        tokens,
+        queue_depth=8,
+        waiting_reqs=8,
+    )
+
+    safe = _candidate(decision, 1)
+    assert safe["contextual_role"] == "safe"
+    assert safe["contextual_count"] == 0
+
+
+def _seed_contextual_response(controller, m, context, log_ratio, count=3):
+    model_context = np.append(context, log_ratio if m > 1 else 0.0)
+    for _ in range(count):
+        controller._contextual_state(m).update(
+            context=model_context,
+            target=log_ratio,
+            forgetting_factor=0.98,
+            alpha=0.2,
+            step_id=0,
+        )
+
+
+def test_contextual_queue_trend_blocks_marginal_but_keeps_strong_gain():
+    controller = _contextual_controller(
+        adaptive_ubatch_context_min_observations=3,
+        adaptive_ubatch_min_gain_pct=5.0,
+        adaptive_ubatch_risk_kappa=0.0,
+        adaptive_ubatch_switch_confirmations=2,
+    )
+    bucket = WorkloadBucket("medium", "prefill", "large")
+    context = np.asarray((1.0,) + (0.0,) * 10)
+    safe = CandidateScore(1, 100.0, 0.0, 100.0, 0.0, 100.0, 3)
+    marginal = CandidateScore(2, 90.0, 0.0, 90.0, 0.0, 90.0, 3)
+    strong = CandidateScore(4, 70.0, 0.0, 70.0, 0.0, 70.0, 3)
+    _seed_contextual_response(controller, 1, context, 0.0)
+    _seed_contextual_response(controller, 2, context, np.log(0.90))
+    _seed_contextual_response(controller, 4, context, np.log(0.70))
+    exposure = controller._exposure_state(bucket, 4)
+    exposure.stage = len(controller._exposure_ratios())
+    exposure.credit = 1.0
+    exposure.validated = True
+    for _ in range(3):
+        controller._regret_state(bucket).add_safe_queue_growth(
+            growth=1.0,
+            window_steps=3,
+        )
+
+    selected, reason, *_, evaluations = controller._apply_contextual_safety(
+        proposed=marginal,
+        safe_score=safe,
+        candidate_scores=[safe, marginal],
+        bucket=bucket,
+        context=tuple(context),
+        regime_warmup=False,
+    )
+    assert selected.m == 1
+    assert reason == "contextual_queue_gain_guard"
+    assert evaluations[2]["contextual_required_gain_pct"] == pytest.approx(
+        5.0 + 5.0 * np.sqrt(2.0)
+    )
+
+    selected, reason, *_ = controller._apply_contextual_safety(
+        proposed=strong,
+        safe_score=safe,
+        candidate_scores=[safe, marginal, strong],
+        bucket=bucket,
+        context=tuple(context),
+        regime_warmup=False,
+    )
+    assert selected.m == 4
+    assert reason == "contextual_bounded_gain"
+
+
+def test_contextual_stable_regime_does_not_repeat_uncertain_exploration():
+    controller = _contextual_controller(
+        adaptive_ubatch_context_min_observations=3,
+        adaptive_ubatch_exploration_interval_steps=1,
+        adaptive_ubatch_exploration_stable_steps=1,
+        adaptive_ubatch_min_gain_pct=5.0,
+        adaptive_ubatch_risk_kappa=1.0,
+    )
+    bucket = WorkloadBucket("medium", "prefill", "large")
+    context = np.asarray((1.0,) + (0.0,) * 10)
+    safe = CandidateScore(1, 100.0, 0.0, 100.0, 0.0, 100.0, 3)
+    uncertain = CandidateScore(2, 95.0, 0.0, 95.0, 0.0, 95.0, 3)
+    _seed_contextual_response(controller, 1, context, 0.0)
+    state = controller._contextual_state(2)
+    state.count = 3
+    state.coefficients.fill(0.0)
+    state.coefficients[0] = np.log(0.90)
+    state.covariance = np.eye(state.dimension) * 0.1
+    state.residual_variance = 0.05
+    controller._regime_state(bucket).stable_observations = 1
+    controller._step_id = 100
+
+    selected, reason, *_ = controller._apply_contextual_safety(
+        proposed=uncertain,
+        safe_score=safe,
+        candidate_scores=[safe, uncertain],
+        bucket=bucket,
+        context=tuple(context),
+        regime_warmup=False,
+    )
+
+    assert selected.m == 1
+    assert reason == "contextual_insufficient_evidence"
+    assert controller._regime_state(bucket).exploration_attempts == {}
+
+
+def test_contextual_underobserved_arm_is_eliminated_when_ucb_is_negative():
+    controller = _contextual_controller(
+        adaptive_ubatch_context_min_observations=3,
+        adaptive_ubatch_exploration_interval_steps=1,
+        adaptive_ubatch_exploration_stable_steps=1,
+        adaptive_ubatch_min_gain_pct=5.0,
+        adaptive_ubatch_risk_kappa=1.0,
+    )
+    bucket = WorkloadBucket("medium", "prefill", "large")
+    context = np.asarray((1.0,) + (0.0,) * 10)
+    safe = CandidateScore(1, 100.0, 0.0, 100.0, 0.0, 100.0, 3)
+    candidate = CandidateScore(2, 70.0, 0.0, 70.0, 0.0, 70.0, 1)
+    _seed_contextual_response(controller, 1, context, 0.0, count=3)
+    state = controller._contextual_state(2)
+    state.count = 1
+    state.coefficients.fill(0.0)
+    state.coefficients[0] = np.log(1.5)
+    state.covariance = np.eye(state.dimension) * 1e-6
+    state.residual_variance = 1e-6
+    controller._regime_state(bucket).stable_observations = 1
+    controller._step_id = 100
+
+    selected, reason, *_, evaluations = controller._apply_contextual_safety(
+        proposed=candidate,
+        safe_score=safe,
+        candidate_scores=[safe, candidate],
+        bucket=bucket,
+        context=tuple(context),
+        regime_warmup=False,
+    )
+
+    assert selected.m == 1
+    assert reason == "contextual_insufficient_evidence"
+    assert evaluations[2]["contextual_gain_ucb_pct"] < 0.0
+    assert controller._regime_state(bucket).probe_m is None
+
+
+def test_contextual_probe_uses_a_contiguous_lease():
+    controller = _contextual_controller(
+        adaptive_ubatch_context_min_observations=3,
+        adaptive_ubatch_exploration_interval_steps=1,
+        adaptive_ubatch_exploration_stable_steps=1,
+        adaptive_ubatch_min_gain_pct=0.0,
+    )
+    bucket = WorkloadBucket("medium", "prefill", "large")
+    context = np.asarray((1.0,) + (0.0,) * 10)
+    safe = CandidateScore(1, 100.0, 0.0, 100.0, 0.0, 100.0, 3)
+    candidate = CandidateScore(2, 80.0, 0.0, 80.0, 0.0, 80.0, 0)
+    _seed_contextual_response(controller, 1, context, 0.0, count=3)
+    controller._regime_state(bucket).stable_observations = 1
+    controller._step_id = 100
+
+    first, first_reason, *_ = controller._apply_contextual_safety(
+        proposed=candidate,
+        safe_score=safe,
+        candidate_scores=[safe, candidate],
+        bucket=bucket,
+        context=tuple(context),
+        regime_warmup=False,
+    )
+    regime = controller._regime_state(bucket)
+    regime.safe_anchor_scale = 1.0
+    regime.safe_anchor_context = tuple(context)
+    regime.safe_anchor_step = controller._step_id + 1
+    regime.safe_anchor_generation = regime.generation
+    controller._step_id += 1
+    second, second_reason, *_ = controller._apply_contextual_safety(
+        proposed=candidate,
+        safe_score=safe,
+        candidate_scores=[safe, candidate],
+        bucket=bucket,
+        context=tuple(context),
+        regime_warmup=False,
+    )
+    controller._step_id += 1
+    third, third_reason, *_ = controller._apply_contextual_safety(
+        proposed=safe,
+        safe_score=safe,
+        candidate_scores=[safe, candidate],
+        bucket=bucket,
+        context=tuple(context),
+        regime_warmup=False,
+    )
+
+    assert first.m == 1
+    assert first_reason == "contextual_probe_pre_anchor"
+    assert second.m == third.m == 2
+    assert second_reason == "contextual_exploration"
+    assert third_reason == "contextual_probe_lease"
+    assert controller._regime_state(bucket).probe_remaining == 2
+
+
+def test_contextual_transition_uses_measured_budget_not_prediction_error():
+    controller = _contextual_controller(
+        adaptive_ubatch_bad_threshold_pct=20.0,
+        adaptive_ubatch_context_min_observations=1,
+        adaptive_ubatch_exploration_interval_steps=1,
+        adaptive_ubatch_exploration_stable_steps=1,
+        adaptive_ubatch_min_gain_pct=0.0,
+    )
+    workload = np.array([1024, 1024], dtype=np.int32)
+    probe = None
+    for _ in range(20):
+        decision = controller.select(
+            workload,
+            queue_depth=4,
+            waiting_reqs=4,
+        )
+        if decision.reason == "contextual_exploration":
+            probe = decision
+            break
+        selected = _candidate(decision, decision.num_ubatches)
+        controller.observe(decision, forward_ms=selected["prior_ms"])
+
+    assert probe is not None
+    assert probe.num_ubatches > 1
+    catastrophic_ms = max(
+        float(probe.predicted_cost_ms) * 2.0,
+        float(probe.contextual_baseline_ms) * 2.0,
+    )
+    controller.observe(probe, forward_ms=catastrophic_ms)
+    bucket = WorkloadBucket.from_key(probe.bucket_key)
+    regime = controller._regime_state(bucket)
+
+    # A large analytical prediction miss alone must not kill an arm before
+    # its transition cost is compared with the measured M=1 safety budget.
+    assert regime.probe_m == probe.num_ubatches
+    assert controller._decision_state(bucket).current_m == probe.num_ubatches
+    assert (bucket.as_tuple(), probe.num_ubatches) not in (
+        controller._cooldown_until
+    )
+
+    protected = controller.select(
+        workload,
+        queue_depth=4,
+        waiting_reqs=4,
+    )
+    assert protected.num_ubatches == 1
+    assert protected.reason == "contextual_regret_budget"
+    assert protected.contextual_regret_pct > 2.0
+    assert controller._regime_state(bucket).probe_m is None
+
+
+def test_contextual_dynamic_regime_allows_one_bounded_revalidation():
+    controller = _contextual_controller(
+        adaptive_ubatch_context_min_observations=3,
+        adaptive_ubatch_exploration_interval_steps=1,
+        adaptive_ubatch_exploration_stable_steps=1,
+        adaptive_ubatch_risk_kappa=1.0,
+    )
+    bucket = WorkloadBucket("medium", "prefill", "large")
+    context = np.asarray((1.0,) + (0.0,) * 10)
+    safe = CandidateScore(1, 100.0, 0.0, 100.0, 0.0, 100.0, 3)
+    uncertain = CandidateScore(2, 95.0, 0.0, 95.0, 0.0, 95.0, 3)
+    _seed_contextual_response(controller, 1, context, 0.0)
+    state = controller._contextual_state(2)
+    state.count = 3
+    state.coefficients.fill(0.0)
+    state.coefficients[0] = np.log(0.90)
+    state.covariance = np.eye(state.dimension) * 0.1
+    state.residual_variance = 0.05
+    regime = controller._regime_state(bucket)
+    regime.generation = 1
+    regime.stable_observations = 1
+    controller._step_id = 100
+
+    selected, reason, *_ = _apply_contextual_after_safe_anchor(
+        controller,
+        proposed=uncertain,
+        safe_score=safe,
+        candidate_scores=[safe, uncertain],
+        bucket=bucket,
+        context=context,
+    )
+    assert selected.m == 2
+    assert reason == "contextual_exploration"
+    assert regime.exploration_attempts[2] == 1
+
+    lease_reasons = []
+    for _ in range(3):
+        controller._step_id += 1
+        selected, reason, *_ = controller._apply_contextual_safety(
+            proposed=uncertain,
+            safe_score=safe,
+            candidate_scores=[safe, uncertain],
+            bucket=bucket,
+            context=tuple(context),
+            regime_warmup=False,
+        )
+        lease_reasons.append(reason)
+        assert selected.m == 2
+    assert lease_reasons == ["contextual_probe_lease"] * 3
+
+    controller._step_id += 1
+    selected, reason, *_ = controller._apply_contextual_safety(
+        proposed=uncertain,
+        safe_score=safe,
+        candidate_scores=[safe, uncertain],
+        bucket=bucket,
+        context=tuple(context),
+        regime_warmup=False,
+    )
+    assert selected.m == 1
+    assert reason == "contextual_probe_post_anchor"
+
+
+def test_contextual_safe_anchor_corrects_the_candidate_baseline():
+    controller = _contextual_controller(
+        adaptive_ubatch_context_min_observations=1,
+        adaptive_ubatch_max_correction_ratio=0.5,
+    )
+    bucket = WorkloadBucket("medium", "prefill", "large")
+    context = np.asarray((1.0,) + (0.0,) * 10)
+    safe = CandidateScore(1, 100.0, 0.0, 100.0, 0.0, 100.0, 3)
+    candidate = CandidateScore(2, 90.0, 0.0, 90.0, 0.0, 90.0, 3)
+    _seed_contextual_response(controller, 1, context, 0.0, count=1)
+    _seed_contextual_response(
+        controller,
+        2,
+        context,
+        np.log(0.9),
+        count=1,
+    )
+    regime = controller._regime_state(bucket)
+    regime.safe_anchor_scale = 1.5
+    regime.safe_anchor_context = tuple(context)
+    regime.safe_anchor_step = controller._step_id
+    regime.safe_anchor_generation = regime.generation
+
+    _, _, _, baseline_ms, _, evaluations = (
+        controller._apply_contextual_safety(
+            proposed=candidate,
+            safe_score=safe,
+            candidate_scores=[safe, candidate],
+            bucket=bucket,
+            context=tuple(context),
+            regime_warmup=False,
+        )
+    )
+
+    assert baseline_ms == pytest.approx(150.0)
+    assert evaluations[2]["contextual_baseline_source"] == (
+        "paired_safe_anchor"
+    )
+
+
+def test_contextual_candidate_regret_is_isolated_by_m():
+    controller = _contextual_controller(
+        adaptive_ubatch_context_min_observations=1,
+        adaptive_ubatch_max_size=4,
+        adaptive_ubatch_regret_budget_pct=2.0,
+    )
+    bucket = WorkloadBucket("medium", "prefill", "large")
+    context = np.asarray((1.0,) + (0.0,) * 10)
+    safe = CandidateScore(1, 100.0, 0.0, 100.0, 0.0, 100.0, 3)
+    m2 = CandidateScore(2, 80.0, 0.0, 80.0, 0.0, 80.0, 3)
+    m4 = CandidateScore(4, 70.0, 0.0, 70.0, 0.0, 70.0, 3)
+    _seed_contextual_response(controller, 1, context, 0.0, count=1)
+    _seed_contextual_response(
+        controller, 2, context, np.log(0.8), count=1
+    )
+    _seed_contextual_response(
+        controller, 4, context, np.log(0.7), count=1
+    )
+    exposure = controller._exposure_state(bucket, 4)
+    exposure.stage = len(controller._exposure_ratios())
+    exposure.credit = 1.0
+    exposure.validated = True
+    controller._arm_regret_state(bucket, 2).add(
+        regret_ms=5.0,
+        baseline_ms=100.0,
+        window_steps=64,
+    )
+
+    selected, reason, *_, evaluations = (
+        controller._apply_contextual_safety(
+            proposed=m2,
+            safe_score=safe,
+            candidate_scores=[safe, m2, m4],
+            bucket=bucket,
+            context=tuple(context),
+            regime_warmup=False,
+        )
+    )
+
+    assert selected.m == 4
+    assert reason == "contextual_bounded_gain"
+    assert evaluations[2]["contextual_candidate_regret_pct"] >= 2.0
+    assert evaluations[4]["contextual_candidate_regret_pct"] == 0.0
+
+
+def test_contextual_queue_trend_updates_without_timing_feedback():
+    controller = _contextual_controller(
+        adaptive_ubatch_exploration_stable_steps=2,
+    )
+    workload = np.array([1024, 1024], dtype=np.int32)
+
+    for queue_depth in range(1, 11):
+        controller.select(
+            workload,
+            queue_depth=queue_depth,
+            waiting_reqs=max(0, queue_depth - 2),
+        )
+
+    bucket = WorkloadBucket("medium", "prefill", "large")
+    state = controller._regret_state(bucket)
+    assert len(state.safe_queue_growth) >= 8
+    assert state.safe_queue_positive_ratio(min_samples=8) > 0.9
+
+
+def test_contextual_window_ignores_one_transient_regime_outlier():
+    controller = _contextual_controller(
+        adaptive_ubatch_context_change_threshold=0.05,
+        adaptive_ubatch_exploration_stable_steps=4,
+        adaptive_ubatch_switch_confirmations=2,
+    )
+    bucket = WorkloadBucket("medium", "prefill", "large")
+    steady = (1.0, 0.3, 0.5, 0.4, 0.5, 0.5, 0.95, 0.9, 0.2, 0.0, 0.0)
+    outlier = (1.0, 0.3, 0.8, 0.8, 0.8, 0.7, 0.5, 0.5, 0.9, 0.8, 0.8)
+
+    for _ in range(12):
+        controller._update_context_regime(
+            bucket=bucket,
+            context=steady,
+        )
+    controller._update_context_regime(bucket=bucket, context=outlier)
+    for _ in range(8):
+        controller._update_context_regime(
+            bucket=bucket,
+            context=steady,
+        )
+
+    state = controller._regime_state(bucket)
+    assert state.generation == 0
+    assert state.warming_up is False
+
+
+def test_contextual_candidate_exposure_promotes_and_demotes_by_window():
+    controller = _contextual_controller(
+        adaptive_ubatch_exposure_stages="0.05,0.10,0.25,0.50",
+        adaptive_ubatch_exposure_validation_observations=3,
+        adaptive_ubatch_exposure_promotion_gain_pct=2.0,
+    )
+    bucket = WorkloadBucket("medium", "prefill", "large")
+
+    outcomes = [
+        controller._record_exposure_observation(
+            bucket=bucket,
+            m=2,
+            relative_ratio=0.90,
+            queue_growth=0.0,
+        )
+        for _ in range(3)
+    ]
+    assert outcomes[-1] == (2, "promoted")
+
+    outcomes = [
+        controller._record_exposure_observation(
+            bucket=bucket,
+            m=2,
+            relative_ratio=1.05,
+            queue_growth=1.0,
+        )
+        for _ in range(3)
+    ]
+    assert outcomes[-1] == (1, "demoted")
+
+
+def test_contextual_proven_candidate_is_rate_limited_at_first_stage():
+    controller = _contextual_controller(
+        adaptive_ubatch_context_min_observations=1,
+        adaptive_ubatch_exposure_stages="0.05,0.10,0.25,0.50",
+        adaptive_ubatch_risk_kappa=0.0,
+    )
+    bucket = WorkloadBucket("medium", "prefill", "large")
+    context = np.asarray((1.0,) + (0.0,) * 10)
+    safe = CandidateScore(1, 100.0, 0.0, 100.0, 0.0, 100.0, 3)
+    candidate = CandidateScore(2, 70.0, 0.0, 70.0, 0.0, 70.0, 3)
+    _seed_contextual_response(controller, 1, context, 0.0, count=1)
+    _seed_contextual_response(
+        controller, 2, context, np.log(0.70), count=1
+    )
+    exposure = controller._exposure_state(bucket, 2)
+    exposure.stage = 1
+
+    selected_ms = []
+    reasons = []
+    for _ in range(20):
+        selected, reason, *_ = controller._apply_contextual_safety(
+            proposed=candidate,
+            safe_score=safe,
+            candidate_scores=[safe, candidate],
+            bucket=bucket,
+            context=tuple(context),
+            regime_warmup=False,
+        )
+        selected_ms.append(selected.m)
+        reasons.append(reason)
+
+    assert selected_ms.count(2) == 1
+    assert reasons.count("contextual_exposure_validation") == 1
+    assert reasons.count("contextual_exposure_guard") == 19
